@@ -5,9 +5,11 @@ module top
 
 // ---- IF stage outputs → IF_ID_reg ----
 wire [31:0] PC_IF, PCPlus4_IF, Instr_IF;
+wire Predicted_Taken_IF;
 
 // ---- IF_ID_reg outputs → ID_stage / ID_EX_reg ----
 wire [31:0] PC_ID, PCPlus4_ID, Instr_ID;
+wire Predicted_Taken_ID;
 
 // ---- ID_stage outputs → ID_EX_reg ----
 wire [31:0] RD1_ID, RD2_ID, ImmExt_ID;
@@ -22,11 +24,11 @@ wire [4:0] WA_EX;
 wire [3:0] ALUControl_EX;
 wire [2:0] Funct3_EX;
 wire [1:0] Width_EX, ResultSrc_EX;
-wire RegWrite_EX, ALUSrc_EX, MemWrite_EX, Branch_EX, Jump_EX;
+wire RegWrite_EX, ALUSrc_EX, MemWrite_EX, Branch_EX, Jump_EX, Predicted_Taken_EX;
 
 // ---- EX_stage outputs → EX_MEM_reg (+ feedback to IF_stage) ----
-wire [31:0] Result_EX, PCTarget_EX;
-wire PCSrc_EX, IsJalr_EX;
+wire [31:0] Result_EX, PCTarget_EX, EX_RedirectPC_EX;
+wire IsJalr_EX, EX_Override_EX;
 
 // ---- EX_MEM_reg outputs → MEM_stage / MEM_WB_reg ----
 wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM;
@@ -74,28 +76,29 @@ IF_stage IF_stage_inst
 (
     .clk(clk),
     .reset(reset),
-    .PCSrc(PCSrc_EX),
-    .IsJalr(IsJalr_EX),
     .Stall(Stall),
-    .PCTarget(PCTarget_EX),
-    .ALUResult(Result_EX),
+    .EX_Override(EX_Override_EX),
+    .EX_RedirectPC(EX_RedirectPC_EX),
     .PC(PC_IF),
     .PCPlus4(PCPlus4_IF),
-    .Instr(Instr_IF)
+    .Instr(Instr_IF),
+    .Predicted_Taken(Predicted_Taken_IF)
 );
 
 IF_ID_reg IF_ID_reg_inst
 (
     .clk(clk),
     .reset(reset),
-    .Flush(PCSrc_EX),
+    .Flush(EX_Override_EX),
     .Stall(Stall),
+    .Predicted_Taken_In(Predicted_Taken_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
     .PC_Plus_4_In(PCPlus4_IF),
     .Instr_Out(Instr_ID),
     .PC_Out(PC_ID),
-    .PC_Plus_4_Out(PCPlus4_ID)
+    .PC_Plus_4_Out(PCPlus4_ID),
+    .Predicted_Taken_Out(Predicted_Taken_ID)
 );
 
 ID_stage ID_stage_inst
@@ -121,7 +124,7 @@ ID_EX_reg ID_EX_reg_inst
 (
     .clk(clk),
     .reset(reset),
-    .Flush(PCSrc_EX),
+    .Flush(EX_Override_EX),
     .Stall(Stall),
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
@@ -137,6 +140,7 @@ ID_EX_reg ID_EX_reg_inst
     .MemWrite_In(MemWrite_ID),
     .Branch_In(Branch_ID),
     .Jump_In(Jump_ID),
+    .Predicted_Taken_In(Predicted_Taken_ID),
     .PC_Out(PC_EX),
     .PC_Plus_4_Out(PCPlus4_EX),
     .RD1_Out(RD1_EX),
@@ -152,7 +156,8 @@ ID_EX_reg ID_EX_reg_inst
     .ALUSrc_Out(ALUSrc_EX),
     .MemWrite_Out(MemWrite_EX),
     .Branch_Out(Branch_EX),
-    .Jump_Out(Jump_EX)
+    .Jump_Out(Jump_EX),
+    .Predicted_Taken_Out(Predicted_Taken_EX)
 );
 
 //Stall logic
@@ -205,16 +210,19 @@ EX_stage EX_stage_inst
     .ALUSrc(ALUSrc_EX),
     .Branch(Branch_EX),
     .Jump(Jump_EX),
+    .Predicted_Taken(Predicted_Taken_EX),
     .ALUControl(ALUControl_EX),
     .ImmExt(ImmExt_EX),
     .RD1(ForwardedRD1),
     .RD2(ForwardedRD2),
     .PC(PC_EX),
     .Instr(Instr_EX),
-    .PCSrc(PCSrc_EX),
+    .PC_Plus_4(PCPlus4_EX),
     .IsJalr(IsJalr_EX),
+    .EX_Override(EX_Override_EX),
     .Result(Result_EX),
-    .PCTarget(PCTarget_EX)
+    .PCTarget(PCTarget_EX),
+    .EX_RedirectPC(EX_RedirectPC_EX)
 );
 
 EX_MEM_reg EX_MEM_reg_inst

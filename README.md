@@ -1,8 +1,8 @@
-# RV32I RISC-V Processor (Single-Cycle → 5-Stage Pipeline)
+# RV32I RISC-V Processor with Machine-Mode Interrupt Handling (Single-Cycle → 5-Stage Pipeline)
 
-A **32-bit RV32I RISC-V Processor** implemented in **Verilog HDL**, originally built as a single-cycle design and since converted into a **5-stage pipelined implementation** (IF → ID → EX → MEM → WB) with full data forwarding and load-use stall handling.
+A **32-bit RV32I RISC-V Processor** implemented in **Verilog HDL**, originally built as a single-cycle design, converted into a **5-stage pipelined implementation** (IF → ID → EX → MEM → WB) with full data forwarding and load-use stall handling, and now extended with **machine-mode trap handling for a single external interrupt**.
 
-This project implements the **RV32I Base Integer Instruction Set Architecture (ISA)** using a modular datapath. The design is divided into independent RTL modules, making it easier to understand, verify, and extend into more advanced processor architectures.
+This project implements the **RV32I Base Integer Instruction Set Architecture (ISA)** using a modular datapath, plus minimal privileged-mode logic (`mepc`, `mcause`, `mtvec`, `mie`, `mret`) to handle a single external interrupt source correctly across all pipeline hazard conditions. The design is divided into independent RTL modules, making it easier to understand, verify, and extend into more advanced processor architectures.
 
 ---
 
@@ -14,11 +14,12 @@ This project implements the **RV32I Base Integer Instruction Set Architecture (I
 - **Full data forwarding**: `forwarding_unit` + `forward_mux` resolve RAW hazards from both EX/MEM and MEM/WB, covering ALU-operand forwarding, store-data forwarding, store-address forwarding, and jalr base-register forwarding
 - **Load-use stall detection**: `stall_unit` inserts a one-cycle bubble (PC hold, `IF_ID_reg` hold, `ID_EX_reg` bubble) when a load's result is needed by the immediately following instruction
 - **Branch/jump flush**: `IF_ID_reg` and `ID_EX_reg` flush on a taken branch or jump, resolved in EX
+- **Single external interrupt handling**: a pending interrupt (gated by `mie`) redirects the PC to a vectored trap address (`mtvec + 4*mcause`), captures the PC of the trapped instruction in `mepc`, disables further interrupts until `mret`, and flushes in-flight wrong-path instructions — correct across branch-in-EX, jal-in-EX, and load-use-stall-in-EX timing windows
 - Modular RTL design, one module per pipeline stage
 - Separate control decoding (`main_decoder`, `alu_decoder`) inside the ID stage
 - Arithmetic Logic Unit (ALU)
 - Register File with same-cycle write-read bypass
-- Program Counter (PC) with branch/jump redirect muxing
+- Program Counter (PC) with branch/jump/trap redirect muxing
 - Instruction Memory
 - Data Memory with byte/halfword/word width control and sign/zero-extended loads
 - Sign Extension Unit
@@ -58,6 +59,11 @@ This project implements the **RV32I Base Integer Instruction Set Architecture (I
 ├── forwarding_unit.v        # RAW hazard detection (EX/MEM, MEM/WB)
 ├── forward_mux.v            # 3-input operand select (regfile / EX-MEM / MEM-WB)
 ├── stall_unit.v             # load-use hazard detection
+├── mepc.v                   # trapped-instruction PC capture register
+├── mcause.v                 # trap cause register (hardcoded to external interrupt, code 7)
+├── mtvec.v                  # trap vector base address
+├── mie.v                    # interrupt-enable register (cleared on trap, set on mret)
+├── pc_mtvec_mcause.v        # trap target address computation (mtvec + 4*mcause)
 ├── top.v                    # pipeline top module
 ├── tb.v
 ├── .gitignore
@@ -72,8 +78,8 @@ This project implements the **RV32I Base Integer Instruction Set Architecture (I
 IF_stage → IF_ID_reg → ID_stage → ID_EX_reg → EX_stage → EX_MEM_reg → MEM_stage → MEM_WB_reg → result_mux → (write-back into register file)
 ```
 
-- **IF**: PC register, PC+4 adder, branch/jump target mux, instruction memory
-- **ID**: register file read (with same-cycle write bypass), immediate sign-extension, control signal decode (`main_decoder`, `alu_decoder`)
+- **IF**: PC register, PC+4 adder, branch/jump/trap target mux, instruction memory
+- **ID**: register file read (with same-cycle write bypass), immediate sign-extension, control signal decode (`main_decoder`, `alu_decoder`), `mret` detection
 - **EX**: ALU, ALU-source mux, PC-target adder, branch decision, `jalr`/`auipc` muxing — operands arrive pre-resolved via `forward_mux` before reaching this stage
 - **MEM**: data memory access, load sign/zero-extension based on `Funct3`
 - **WB**: result mux (ALU result / memory data / PC+4) selects final write-back value; no dedicated WB module — `result_mux` is instantiated directly in `top.v`
@@ -83,12 +89,13 @@ IF_stage → IF_ID_reg → ID_stage → ID_EX_reg → EX_stage → EX_MEM_reg �
 - **Forwarding**: `forwarding_unit` compares the ID/EX-stage instruction's `rs1`/`rs2` against `EX_MEM_reg`'s and `MEM_WB_reg`'s destination register, with EX/MEM given priority when both match (most recent producer wins). Two 3-input `forward_mux` instances (`ForwardA`/`ForwardB`) select between the register-file value, the EX/MEM candidate, and the MEM/WB candidate. The EX/MEM candidate is `ALUResult` for most instructions but switches to `PC+4` for `jal`/`jalr`. The resolved rs2 value (`ForwardedRD2`) feeds both the ALU's B-input and `EX_MEM_reg.RD2_In`, covering both ALU-operand and store-data forwarding with one path.
 - **Stalling**: `stall_unit` detects when the instruction currently in ID/EX is a load whose destination matches either source register of the instruction currently in ID (the 0-gap load-use case forwarding can't resolve, since `ReadData` doesn't exist until MEM). On a hit, it holds the PC and `IF_ID_reg`, and forces a one-cycle bubble into `ID_EX_reg`.
 - **Flush**: a taken branch or jump resolves in EX and asserts `PCSrc`, which flushes the two younger, wrong-path instructions currently sitting in `IF_ID_reg` and `ID_EX_reg`.
+- **Interrupt trap**: `interrupt_taken` (external interrupt asserted AND `mie` set) takes priority over branch/jump redirect at the PC mux, flushes `IF_ID_reg` and `ID_EX_reg`, captures the EX-stage instruction's PC into `mepc`, clears `mie`, and redirects fetch to the vectored trap address. `mret` (decoded in ID) restores fetch to `mepc` and re-enables `mie`.
 
 ---
 
 ## Supported Instructions
 
-All **37 RV32I base instructions** have been individually verified through the pipeline:
+All **37 RV32I base instructions** have been individually verified through the pipeline, plus machine-mode trap return:
 
 | Category | Instructions |
 |---|---|
@@ -99,8 +106,9 @@ All **37 RV32I base instructions** have been individually verified through the p
 | Branches | `beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu` |
 | Jumps | `jal`, `jalr` |
 | Upper immediate | `lui`, `auipc` |
+| Privileged (machine-mode) | `mret` |
 
-> Verification method: instruction functionality was first exercised via hazard-free (NOP-padded) sequences; forwarding and stalling were then verified against a dedicated set of hazard-adversarial sequences written directly into `instruction_memory.v` (0-gap and 1-gap RAW hazards, double-hazard priority, store data/address forwarding, jalr base forwarding, all load-use stall variants, and multi-hazard interaction cases). See inline comments in `instruction_memory.v` for expected register values per test.
+> Verification method: instruction functionality was first exercised via hazard-free (NOP-padded) sequences; forwarding and stalling were then verified against a dedicated set of hazard-adversarial sequences written directly into `instruction_memory.v` (0-gap and 1-gap RAW hazards, double-hazard priority, store data/address forwarding, jalr base forwarding, all load-use stall variants, and multi-hazard interaction cases). Interrupt handling was verified against a separate set of trap-timing-adversarial cases in the same file. See inline comments in `instruction_memory.v` for expected register values per test.
 
 ---
 
@@ -114,6 +122,7 @@ All **37 RV32I base instructions** have been individually verified through the p
 - ✅ EX/MEM and MEM/WB forwarding confirmed for ALU-operand, store-data, store-address, and jalr-base-register hazards, including EX/MEM-vs-MEM/WB priority resolution
 - ✅ Load-use stalling confirmed (rs1-only, rs2-only, both-operand, x0-guard, store-data-consumer, and back-to-back stall cases)
 - ✅ Branch/jump flush confirmed — no wrong-path instruction reaches write-back
+- ✅ Single external interrupt confirmed correct against 7 hazard-adversarial timing cases: baseline trap entry, redundant interrupt pulse mid-ISR correctly ignored (`mie` gating), trap while a branch is unresolved in EX, trap during an active load-use stall, trap while a `jal` is in EX, and correct `mepc`/re-execution/landing-address behavior in every case
 
 ---
 
@@ -171,21 +180,12 @@ gtkwave waves.vcd
 
 ---
 
-## Future Improvements
-
-- BTFNT branch prediction with a 2-bit saturating counter predictor
-- AXI-Lite / AHB-Lite bus interface for SoC integration
-- cocotb-based verification environment
-- Migrate the design to SystemVerilog
-
----
-
 ## Version Control
 
 This project is version-controlled using **Git** and hosted on **GitHub**.
 
 - `main` — tracks the current 5-stage pipeline implementation with forwarding and stalling
-- `pipeline` — development branch where forwarding/stalling were built and verified before merging to `main`
+- `pipeline` — development branch where forwarding/stalling and interrupt handling were built and verified before merging to `main`
 
 The original single-cycle implementation remains available in the commit history prior to the pipeline merge into `main`.
 

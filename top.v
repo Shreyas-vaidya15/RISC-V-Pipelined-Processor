@@ -1,6 +1,6 @@
 module top
 (
-  input clk, reset
+  input clk, reset, interrupt
 );
 
 // ---- IF stage outputs → IF_ID_reg ----
@@ -16,7 +16,7 @@ wire [31:0] RD1_ID, RD2_ID, ImmExt_ID;
 wire [4:0] WA_ID;
 wire [3:0] ALUControl_ID;
 wire [1:0] ResultSrc_ID;
-wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID;
+wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID, Mret_taken_ID;
 
 // ---- ID_EX_reg outputs → EX_stage / EX_MEM_reg ----
 wire [31:0] PC_EX, PCPlus4_EX, RD1_EX, RD2_EX, ImmExt_EX, Instr_EX;
@@ -54,21 +54,26 @@ assign WA_ID = Instr_ID[11:7];
 
 // ============ FORWARDING WIRES ============
 
-// EX/MEM candidate value: ALUResult for everything except jal/jalr, which need PC+4 instead
 wire [31:0] EX_MEM_Candidate;
 assign EX_MEM_Candidate = (ResultSrc_MEM == 2'b10) ? PCPlus4_MEM : ALUResult_MEM;
 
-// MEM/WB candidate value: reuse Result_WB directly — it's already the fully-resolved
-// write-back value (ALUResult / ReadData / PC+4, correctly selected by result_mux)
-
-// forwarding_unit outputs: which source wins for rs1 (ForwardA) and rs2 (ForwardB)
 wire [1:0] ForwardA, ForwardB;
-
-// forward_mux outputs: the final, correct operand values for EX_stage
 wire [31:0] ForwardedRD1, ForwardedRD2;
 
-//Stall wires
 wire Stall;
+
+// ============ INTERRUPT / TRAP WIRES ============
+
+wire [31:0] mepc_val, mcause_val, mtvec_val, pc_mtvec_mcause_val;
+wire mie_val;
+wire interrupt_taken;
+
+assign interrupt_taken = interrupt & mie_val;
+
+// Combinational mirror of the exception code mcause.v will latch.
+// Used ONLY for the trap-target math so the redirect doesn't lag
+// one cycle behind the registered mcause_val (same-cycle race fix).
+wire [31:0] mcause_next = {1'b1, 31'd7};
 
 // ============ INSTANTIATIONS ============
 
@@ -78,7 +83,11 @@ IF_stage IF_stage_inst
     .reset(reset),
     .Stall(Stall),
     .EX_Override(EX_Override_EX),
+    .Mret_taken(Mret_taken_ID),
+    .interrupt_taken(interrupt_taken),
     .EX_RedirectPC(EX_RedirectPC_EX),
+    .mepc(mepc_val),
+    .pc_mtvec_mcause(pc_mtvec_mcause_val),
     .PC(PC_IF),
     .PCPlus4(PCPlus4_IF),
     .Instr(Instr_IF),
@@ -91,6 +100,8 @@ IF_ID_reg IF_ID_reg_inst
     .reset(reset),
     .Flush(EX_Override_EX),
     .Stall(Stall),
+    .Mret_taken(Mret_taken_ID),
+    .interrupt_taken(interrupt_taken),
     .Predicted_Taken_In(Predicted_Taken_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
@@ -113,6 +124,7 @@ ID_stage ID_stage_inst
     .MemWrite(MemWrite_ID),
     .RegWrite(RegWrite_ID),
     .ALUSrc(ALUSrc_ID),
+    .Mret_taken(Mret_taken_ID),
     .ResultSrc(ResultSrc_ID),
     .ALUControl(ALUControl_ID),
     .rd1(RD1_ID),
@@ -126,6 +138,7 @@ ID_EX_reg ID_EX_reg_inst
     .reset(reset),
     .Flush(EX_Override_EX),
     .Stall(Stall),
+    .interrupt_taken(interrupt_taken),
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
     .RD1_In(RD1_ID),
@@ -160,7 +173,6 @@ ID_EX_reg ID_EX_reg_inst
     .Predicted_Taken_Out(Predicted_Taken_EX)
 );
 
-//Stall logic
 stall_unit stall_unit_inst
 (
     .ID_EX_opcode(Instr_EX[6:0]),
@@ -170,8 +182,6 @@ stall_unit stall_unit_inst
     .Stall(Stall)
 );
 
-// ---- Forwarding hazard detection: compares ID_EX's rs1/rs2 against
-//      EX_MEM's and MEM_WB's destination registers ----
 forwarding_unit forwarding_unit_inst
 (
     .rs1(Instr_EX[19:15]),
@@ -184,7 +194,6 @@ forwarding_unit forwarding_unit_inst
     .ForwardB(ForwardB)
 );
 
-// ---- rs1 forwarding mux: regfile value vs EX/MEM candidate vs MEM/WB candidate ----
 forward_mux forward_mux_A
 (
     .regfile_rs(RD1_EX),
@@ -194,8 +203,6 @@ forward_mux forward_mux_A
     .final_rs(ForwardedRD1)
 );
 
-// ---- rs2 forwarding mux: feeds both the ALU's B input (via EX_stage) and
-//      EX_MEM_reg.RD2_In (store data path) ----
 forward_mux forward_mux_B
 (
     .regfile_rs(RD2_EX),
@@ -229,6 +236,7 @@ EX_MEM_reg EX_MEM_reg_inst
 (
     .clk(clk),
     .reset(reset),
+    .interrupt_taken(interrupt_taken),
     .PC_Plus_4_In(PCPlus4_EX),
     .ALUResult_In(Result_EX),
     .RD2_In(ForwardedRD2),
@@ -285,6 +293,46 @@ result_mux result_mux_inst
     .ReadData(ReadData_WB),
     .PC_Plus_4(PCPlus4_WB),
     .ResultSrc(ResultSrc_WB)
+);
+
+// ---- CSR / trap logic ----
+
+mepc mepc_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .EX_MEPC_IN(PC_EX),
+    .MEPC_OUT(mepc_val)
+);
+
+mcause mcause_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .mcause(mcause_val)
+);
+
+mtvec mtvec_inst
+(
+    .mtvec(mtvec_val)
+);
+
+pc_mtvec_mcause pc_mtvec_mcause_inst
+(
+    .mtvec(mtvec_val),
+    .mcause(mcause_next),
+    .pc_mtvec_mcause(pc_mtvec_mcause_val)
+);
+
+mie mie_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .mret_taken(Mret_taken_ID),
+    .mie_out(mie_val)
 );
 
 endmodule

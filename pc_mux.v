@@ -7,12 +7,13 @@ module pc_mux(
     input [31:0] pc_mtvec_mcause,
     input EX_Override,
     input Mret_taken,
-    input interrupt_taken,
+    input interrupt_keyboard_taken,
+    input interrupt_disk_taken,
     input Predicted_Taken
 );
 always @(*) 
 begin
-    if (interrupt_taken)
+    if (interrupt_disk_taken ||interrupt_keyboard_taken)
     begin
         PC_Next = pc_mtvec_mcause;
     end

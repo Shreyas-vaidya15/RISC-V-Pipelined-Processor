@@ -39,6 +39,7 @@
 			4'b1010: Result = A <<< B[4:0];
 			4'b1011: Result = $signed(A) >>> B[4:0];
 			4'b1100: Result = A >> B[4:0];
+			4'b1101: Result = ~A & B;
 			default : Result = 32'bx;		 
 		endcase
 		Zero = ~|Result;

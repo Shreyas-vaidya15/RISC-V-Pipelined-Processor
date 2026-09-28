@@ -41,6 +41,7 @@ end
 			3'b000, 3'b001, 3'b101 : ALUControl = 4'bxxxx;
 			3'b010, 3'b110 : ALUControl = 4'b0011;
 			3'b011, 3'b111 : ALUControl = 4'b1101;
+			default : ALUControl = 4'bxxxx;
 			endcase
 		end
 		default : ALUControl = 4'bxxxx;

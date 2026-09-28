@@ -1,6 +1,6 @@
 module mie
 (
-    input clk, reset, interrupt_keyboard_taken, interrupt_disk_taken, mret_taken, mie_write_en, csr_wdata_b0,
+    input clk, reset, interrupt_taken, mret_taken, mie_write_en, csr_wdata_b0,
     output reg mie_out
 );
 
@@ -12,7 +12,7 @@ begin
 mie_out <= 1'b1;
 end
 
-else if(interrupt_keyboard_taken || interrupt_disk_taken)
+else if(interrupt_taken)
 begin
 mie_out <= 1'b0;
 end

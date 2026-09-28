@@ -3,13 +3,13 @@ module ID_stage
     input clk, we, 
     input [4:0] wa,
     input [31:0] wd, Instr_In,
-    output Jump, Branch, MemWrite, RegWrite, ALUSrc,
+    output Jump, Branch, MemWrite, RegWrite, ALUSrc, Mret_taken, IsCSR,
     output [1:0] ResultSrc,
     output [3:0] ALUControl,
     output [31:0] rd1, rd2, ImmExt
 );
 
-wire [1:0] ALUop;
+wire [2:0] ALUop;
 wire [2:0] ImmSrc;
 
 main_decoder main_decoder_inst
@@ -22,7 +22,10 @@ main_decoder main_decoder_inst
     .Branch(Branch),
     .ALUop(ALUop),
     .Jump(Jump),
-    .op(Instr_In[6:0])
+    .Mret_taken(Mret_taken),
+    .IsCSR(IsCSR),
+    .op(Instr_In[6:0]),
+    .funct3(Instr_In[14:12])
 );
 
 alu_decoder alu_decoder_inst

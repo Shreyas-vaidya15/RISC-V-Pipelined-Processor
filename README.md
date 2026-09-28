@@ -1,8 +1,8 @@
-# RV32I RISC-V Processor (Single-Cycle → 5-Stage Pipeline with BTFNT Branch Prediction)
+# RV32I RISC-V Processor with Priority-Based Nested Interrupts (5-Stage Pipeline)
 
-A **32-bit RV32I RISC-V Processor** implemented in **Verilog HDL**, originally built as a single-cycle design and since converted into a **5-stage pipelined implementation** (IF → ID → EX → MEM → WB) with full data forwarding, load-use stall handling, and BTFNT (Backward-Taken/Forward-Not-Taken) branch prediction.
+A **32-bit RV32I RISC-V Processor** implemented in **Verilog HDL** and built up in stages: a single-cycle design, converted into a **5-stage pipelined implementation** (IF → ID → EX → MEM → WB), then given hazard control (full data forwarding and load-use stall handling), then **BTFNT static branch prediction** (backward-taken, forward-not-taken: a branch that jumps backward, like a loop, is guessed taken; one that jumps forward is guessed not taken), and finally extended with **machine-mode trap handling for two external interrupt sources (keyboard, disk) with hardware priority tracking and software-managed nesting**.
 
-This project implements the **RV32I Base Integer Instruction Set Architecture (ISA)** using a modular datapath. The design is divided into independent RTL modules, making it easier to understand, verify, and extend into more advanced processor architectures.
+The design implements the **RV32I Base Integer Instruction Set** using a modular datapath, plus privileged-mode logic (`mepc`, `mcause`, `mtvec`, `mie`, `mret`, current/previous priority registers, and the `csrrw`/`csrrs`/`csrrc` family) so that multiple interrupt sources are handled correctly across all pipeline hazard conditions, including interrupts nesting inside one another.
 
 ---
 
@@ -11,20 +11,17 @@ This project implements the **RV32I Base Integer Instruction Set Architecture (I
 - 32-bit RV32I architecture
 - **5-stage pipelined datapath**: IF, ID, EX, MEM, WB
 - Dedicated pipeline registers: `IF_ID_reg`, `ID_EX_reg`, `EX_MEM_reg`, `MEM_WB_reg`
-- **Full data forwarding**: `forwarding_unit` + `forward_mux` resolve RAW hazards from both EX/MEM and MEM/WB, covering ALU-operand forwarding, store-data forwarding, store-address forwarding, and jalr base-register forwarding
-- **Load-use stall detection**: `stall_unit` inserts a one-cycle bubble (PC hold, `IF_ID_reg` hold, `ID_EX_reg` bubble) when a load's result is needed by the immediately following instruction
-- **BTFNT static branch prediction**: backward branches predicted taken, forward branches predicted not-taken, resolved and corrected in EX with a same-cycle flush on misprediction
-- **Branch/jump flush**: `IF_ID_reg` and `ID_EX_reg` flush on any EX-stage redirect (misprediction, `jal`, or `jalr`)
-- Modular RTL design, one module per pipeline stage
-- Separate control decoding (`main_decoder`, `alu_decoder`) inside the ID stage
-- Arithmetic Logic Unit (ALU)
-- Register File with same-cycle write-read bypass
-- Program Counter (PC) with branch/jump redirect muxing
-- Instruction Memory
-- Data Memory with byte/halfword/word width control and sign/zero-extended loads
-- Sign Extension Unit
-- Multiplexers for datapath control
-- Verilog testbench for functional verification
+- **Full data forwarding**: `forwarding_unit` + `forward_mux` resolve RAW hazards from EX/MEM and MEM/WB (ALU operands, store data/address, `jalr` base, CSR reads)
+- **Load-use stall detection**: `stall_unit` inserts a one-cycle bubble when a load's result is needed by the next instruction
+- **BTFNT static branch prediction** (backward-taken, forward-not-taken): predicted in IF from the sign of the branch offset, resolved in EX; mispredicts and jumps flush `IF_ID_reg` and `ID_EX_reg`
+- **Two external interrupt sources (keyboard, disk)**, each with its own pending latch (`interrupt_latch`)
+- **Priority-based arbitration**: `interrupt_priority_encoder` reports the highest pending source (disk = 2, keyboard = 1, none = 0). A trap is taken only if that level is **>= the level currently running** (`current_priority`)
+- **Hardware priority save/restore**: on trap entry `previous_priority <= current_priority` and `current_priority <= interrupt_ID`; `mret` restores `current_priority <= previous_priority`
+- **Vectored traps**: PC redirects to `mtvec + 4 * cause` (keyboard cause 7, disk cause 27); the losing source's pending bit is *not* dropped
+- **Software-managed nesting, arbitrary depth**: the ISR saves `mepc`, `mcause`, `previous_priority` and any live GPRs on a stack in `data_memory` *before* re-enabling `mie`; verified 3 levels deep
+- Register file with same-cycle write-read bypass
+- Data memory with byte/halfword/word access and sign/zero-extended loads (also serves as the interrupt stack)
+- Self-checking Verilog testbench with an expected-trap scoreboard
 
 ---
 
@@ -35,34 +32,37 @@ This project implements the **RV32I Base Integer Instruction Set Architecture (I
 ├── alu.v
 ├── alu_decoder.v
 ├── alu_mux.v
+├── csr_addr_decoder.v            # CSR address -> write-enable for mepc/mie/mcause/current_priority/previous_priority
+├── csr_read_data.v               # selects old CSR value returned to rd
+├── csr_write_data.v              # selects new CSR value to write, per funct3
+├── current_priority.v            # priority level of the code currently running (0 = main program)
+├── previous_priority.v           # level that was interrupted; restored into current_priority by mret
+├── interrupt_priority_encoder.v  # pending keyboard/disk -> interrupt_ID (2 = disk, 1 = keyboard, 0 = none)
+├── interrupt_latch.v             # per-source pending latch (keyboard + disk instances)
 ├── data_memory.v
 ├── instruction_memory.v
 ├── main_decoder.v
+├── mcause.v                      # trap cause register (7 = keyboard, 27 = disk)
+├── mepc.v                        # PC of the instruction that was interrupted
+├── mie.v                         # interrupt enable (cleared on trap, set by mret / CSR write)
+├── mtvec.v                       # trap vector base address (100)
 ├── pc.v
+├── pc_mtvec_mcause.v             # trap target = mtvec + 4 * cause
 ├── pc_mux.v
 ├── pc_plus_4.v
 ├── pc_target.v
 ├── register_file.v
 ├── result_mux.v
 ├── sign_extender.v
-├── IF_stage.v
-├── IF_ID_reg.v
-├── ID_stage.v
-├── ID_EX_reg.v
-├── EX_stage.v
-├── EX_MEM_reg.v
-├── MEM_stage.v
-├── MEM_WB_reg.v
-├── forwarding_unit.v        # RAW hazard detection (EX/MEM, MEM/WB)
-├── forward_mux.v            # 3-input operand select (regfile / EX-MEM / MEM-WB)
-├── stall_unit.v             # load-use hazard detection
-├── top.v                    # pipeline top module
+├── IF_stage.v / IF_ID_reg.v
+├── ID_stage.v / ID_EX_reg.v
+├── EX_stage.v / EX_MEM_reg.v
+├── MEM_stage.v / MEM_WB_reg.v
+├── forwarding_unit.v             # RAW hazard detection (EX/MEM, MEM/WB)
+├── forward_mux.v                 # 3-input operand select
+├── stall_unit.v                  # load-use hazard detection
+├── top.v                         # pipeline + interrupt logic top module
 ├── tb.v
-├── legacy_singlecycle/      # original single-cycle implementation, unused by pipeline top
-│   ├── data_path.v
-│   ├── control_path.v
-│   └── riscv.v
-├── .gitignore
 └── README.md
 ```
 
@@ -71,31 +71,87 @@ This project implements the **RV32I Base Integer Instruction Set Architecture (I
 ## Pipeline Architecture
 
 ```text
-IF_stage → IF_ID_reg → ID_stage → ID_EX_reg → EX_stage → EX_MEM_reg → MEM_stage → MEM_WB_reg → result_mux → (write-back into register file)
+IF_stage → IF_ID_reg → ID_stage → ID_EX_reg → EX_stage → EX_MEM_reg → MEM_stage → MEM_WB_reg → result_mux → (register file)
 ```
 
-- **IF**: PC register, PC+4 adder, BTFNT prediction (branch direction + predicted target), instruction memory
-- **ID**: register file read (with same-cycle write bypass), immediate sign-extension, control signal decode (`main_decoder`, `alu_decoder`)
-- **EX**: ALU, ALU-source mux, PC-target adder, branch resolution and misprediction detection, `jalr`/`auipc` muxing — operands arrive pre-resolved via `forward_mux` before reaching this stage
-- **MEM**: data memory access, load sign/zero-extension based on `Funct3`
-- **WB**: result mux (ALU result / memory data / PC+4) selects final write-back value; no dedicated WB module — `result_mux` is instantiated directly in `top.v`
+- **IF**: PC register, PC+4 adder, branch predictor, PC mux (trap / EX redirect / `mret` / predicted target / PC+4), instruction memory
+- **ID**: register file read (with write bypass), immediate extension, control decode, `mret` detection (redirects PC to `mepc` from here)
+- **EX**: ALU, branch resolution, `jalr`/`auipc` handling, CSR read/write value computation, trap-acceptance point
+- **MEM**: data memory access, load sign/zero-extension
+- **WB**: `result_mux` selects ALU result / memory data / PC+4 / old CSR value
 
 ### Hazard Control
 
-- **Forwarding**: `forwarding_unit` compares the ID/EX-stage instruction's `rs1`/`rs2` against `EX_MEM_reg`'s and `MEM_WB_reg`'s destination register, with EX/MEM given priority when both match (most recent producer wins). Two 3-input `forward_mux` instances (`ForwardA`/`ForwardB`) select between the register-file value, the EX/MEM candidate, and the MEM/WB candidate. The EX/MEM candidate is `ALUResult` for most instructions but switches to `PC+4` for `jal`/`jalr`. The resolved rs2 value (`ForwardedRD2`) feeds both the ALU's B-input and `EX_MEM_reg.RD2_In`, covering both ALU-operand and store-data forwarding with one path.
-- **Stalling**: `stall_unit` detects when the instruction currently in ID/EX is a load whose destination matches either source register of the instruction currently in ID (the 0-gap load-use case forwarding can't resolve, since `ReadData` doesn't exist until MEM). On a hit, it holds the PC and `IF_ID_reg`, and forces a one-cycle bubble into `ID_EX_reg`.
+- **Forwarding**: EX/MEM has priority over MEM/WB. The EX/MEM candidate is `ALUResult` normally, `PC+4` for `jal`/`jalr`, and the old CSR value for CSR reads.
+- **Stalling**: a load in EX whose destination matches a source of the instruction in ID holds the pipeline one cycle. Stalling is suppressed while an `mret` is in ID (its `rs2` field bits are not a register, so it would otherwise stall falsely).
+- **Flush**: a mispredicted branch or a jump resolves in EX and flushes the two younger instructions.
 
-### Branch Prediction (BTFNT)
+---
 
-- **Prediction**: computed combinationally in `IF_stage` from the just-fetched instruction — backward branches (negative offset, `Instr[31]=1`) predict taken; forward branches (positive offset) predict not-taken. `Predicted_Taken` threads through `IF_ID_reg` and `ID_EX_reg` alongside its instruction so EX always compares against the prediction made for that specific instruction.
-- **Resolution**: `EX_stage` computes `Actual_Taken` from the branch condition and compares against `Predicted_Taken`. `EX_Override = Jump | Mispredict` — `jal`/`jalr` always redirect; branches only redirect on a misprediction. Redirect target is `PCTarget` (mispredicted-taken or jal/jalr) or `PC_Plus_4` (mispredicted-not-taken).
-- **Flush**: any EX-stage redirect flushes `IF_ID_reg` and `ID_EX_reg` the same cycle, discarding the (at most two) wrong-path instructions already fetched. Flush and stall are mutually exclusive by construction — the instruction that can trigger a stall (a load) and the instruction that can trigger a flush (a branch/jump) are never the same instruction.
+## Interrupt Handling
+
+### Trap acceptance
+
+A trap is taken in a cycle when **all** of these hold:
+
+```text
+interrupt_taken = mie
+                & (interrupt_ID != 0)
+                & (interrupt_ID >= current_priority)
+                & EX is not a bubble
+                & EX is not an mret
+```
+
+The last two conditions guarantee `mepc` never captures a bogus PC (a bubble has PC 0; an `mret` in EX has already redirected fetch).
+
+### What happens on trap entry
+
+- `mepc <= PC` of the instruction in EX (that instruction is squashed and re-executed after `mret`)
+- `mcause <= cause code`, `mie <= 0`
+- `previous_priority <= current_priority`, `current_priority <= interrupt_ID`
+- IF/ID, ID/EX and EX/MEM are flushed; PC <= `mtvec + 4 * cause`
+- The served source's pending bit is cleared; the other source's stays set
+
+### What happens on `mret`
+
+- PC <= `mepc` (redirected from the ID stage)
+- `mie <= 1`, `current_priority <= previous_priority`
+- A wrong-path `mret` (behind a mispredicted branch) is ignored for these updates
+
+### Priority and nesting rules
+
+| Running at | Disk (2) asserts | Keyboard (1) asserts |
+|---|---|---|
+| Main program (0) | taken | taken |
+| Keyboard ISR (1) | taken (nests, 2 >= 1) | taken (self-nests, 1 >= 1) |
+| Disk ISR (2) | taken (self-nests) | **blocked** (1 < 2) until disk's `mret` |
+
+Both sources at once: disk wins; keyboard stays pending and fires after disk's `mret`.
+
+### ISR structure
+
+Identical body for both sources (24 instructions, reached through a `jal` trampoline at each vector):
+
+1. Allocate a 32-byte stack frame; save `x6`, `x7`, `mepc`, `mcause`, `previous_priority`
+2. `mie <= 1` (nesting now allowed, gated by the priority compare)
+3. Body (increments a counter and deliberately clobbers `x6`/`x7` to prove save/restore works)
+4. `mie <= 0` (epilogue must be atomic), restore `mcause`, `mepc`, `previous_priority`, `x6`, `x7`, free the frame, `mret`
+
+### CSR map (custom addresses)
+
+| Address | CSR |
+|---|---|
+| 0 | `mepc` |
+| 1 | `mie` |
+| 2 | `mcause` |
+| 3 | `current_priority` |
+| 4 | `previous_priority` |
 
 ---
 
 ## Supported Instructions
 
-All **37 RV32I base instructions** have been individually verified through the pipeline:
+All **37 RV32I base instructions**, plus machine-mode trap support:
 
 | Category | Instructions |
 |---|---|
@@ -106,87 +162,63 @@ All **37 RV32I base instructions** have been individually verified through the p
 | Branches | `beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu` |
 | Jumps | `jal`, `jalr` |
 | Upper immediate | `lui`, `auipc` |
-
-> Verification method: instruction functionality was first exercised via hazard-free (NOP-padded) sequences; forwarding, stalling, and BTFNT prediction were then verified against dedicated hazard-adversarial and control-flow sequences written directly into `instruction_memory.v` (0-gap and 1-gap RAW hazards, double-hazard priority, store data/address forwarding, jalr base forwarding, all load-use stall variants, multi-hazard interaction cases, backward/forward branches under correct and mispredicted BTFNT outcomes, jal/jalr override, zero-gap back-to-back branches, and a branch landing directly on a misprediction redirect). See inline comments in `instruction_memory.v` for expected register values per test.
+| Privileged | `mret`, `csrrw`, `csrrs`, `csrrc`, `csrrwi`, `csrrsi`, `csrrci` |
 
 ---
 
 ## Verification Status
 
-- ✅ All 37 RV32I instructions functionally correct in isolation (hazard-free sequencing)
-- ✅ Pipeline register timing confirmed (4-cycle IF→WB latency)
-- ✅ Branch/jump redirect target computation confirmed correct
-- ✅ x0 write-immunity confirmed
-- ✅ Signed vs. unsigned comparison/shift correctness confirmed (`slt` vs `sltu`, `sra` vs `srl`, `blt` vs `bltu`, etc.)
-- ✅ EX/MEM and MEM/WB forwarding confirmed for ALU-operand, store-data, store-address, and jalr-base-register hazards, including EX/MEM-vs-MEM/WB priority resolution
-- ✅ Load-use stalling confirmed (rs1-only, rs2-only, both-operand, x0-guard, store-data-consumer, and back-to-back stall cases)
-- ✅ BTFNT branch prediction confirmed: backward-taken (correct), backward-not-taken (mispredict), forward-not-taken (correct), forward-taken (mispredict), `jal`/`jalr` unconditional override, zero-gap load-use stall feeding a backward-branch condition, back-to-back branches with independent/opposite predictions and zero pipeline gap, and a branch instruction landing directly on a misprediction redirect (two consecutive flushes)
-- ✅ Branch/jump flush confirmed — no wrong-path instruction reaches write-back
+`tb.v` is self-checking: it pulses the interrupt inputs at chosen PCs, compares every trap against an expected `{cause, mepc}` table, and checks final register/CSR state. A passing run prints `=== ALL CHECKS PASSED ===`.
+
+| Phase | Scenario | Traps |
+|---|---|---|
+| A | Keyboard alone | 1 |
+| B | Disk alone | 1 |
+| C | Simultaneous: disk first, keyboard after disk's `mret` | 2 |
+| D | Keyboard outer, disk nests (2 >= 1) | 2 |
+| E | Disk outer, keyboard **blocked** by priority (1 < 2) until `mret` | 2 |
+| F | Keyboard self-nests, 2 levels | 2 |
+| G | Disk asserted while `mie = 0`; held, fires when `mie` re-enabled | 2 |
+| H | Keyboard self-nests, 3 levels | 3 |
+
+Checked at the end of every phase: `sp` back to 200, live registers `x6`/`x7` intact despite ISR clobbering, trap counter matches the number of traps logged. Final checks also cover `mie = 1`, `current_priority = 0`, no pending bits left, and a deepest stack use of 3 frames. Also verified: all 37 RV32I instructions, forwarding (including CSR reads), load-use stalls (including `lw` → `csrrw` in the ISR), branch/jump flush, x0 write immunity.
+
+All Zicsr instructions are exercised: `csrrs`, `csrrw`, `csrrwi` by the interrupt test suite (ISR save/restore), and `csrrc`, `csrrsi`, `csrrci` by a separate short test program whose read-back values (`x10`–`x13` and `mepc`) were checked against expected results, including forwarding into `csrrc` and back-to-back CSR instructions.
+
+### Known limitations
+
+- Interrupt inputs must be **1-cycle pulses**: the latch is level-sensitive, so an input held high re-latches right after being served.
+- A CSR write is not forwarded to `mret`: `mepc` and `previous_priority` must be written at least one instruction before `mret` (the ISR does this).
+- `csrrs`/`csrrc` with `rs1 = x0` still write the (unchanged) value back; the RISC-V spec says they should not write.
+- Priority scheme is fixed at two levels (keyboard 1, disk 2); adding sources means widening the priority registers and encoder.
 
 ---
 
 ## Development Environment
 
-- Visual Studio Code
-- GitHub Desktop
-
----
-
-## Tools Used
-
-- Verilog HDL
-- Icarus Verilog
-- GTKWave
-- Git
-- GitHub
-
----
-
-## Requirements
-
-- Icarus Verilog
-- GTKWave
+- Visual Studio Code, GitHub Desktop
+- Verilog HDL, Icarus Verilog, GTKWave, Git, GitHub
 
 ---
 
 ## Running the Simulation
 
-### Compile the design
-
 ```bash
 iverilog -o sim_out *.v
-```
-
-### Run the simulation
-
-```bash
 vvp sim_out
-```
-
-### View the waveform
-
-Windows:
-
-```bash
-"C:\iverilog\gtkwave\bin\gtkwave.exe" waves.vcd
-```
-
-If GTKWave is available in your system PATH:
-
-```bash
 gtkwave waves.vcd
 ```
+
+On Windows, GTKWave can be launched with `"C:\iverilog\gtkwave\bin\gtkwave.exe" waves.vcd`.
 
 ---
 
 ## Version Control
 
-This project is version-controlled using **Git** and hosted on **GitHub**.
+- `main` — current 5-stage pipeline with forwarding, stalling and priority-based nested interrupts
+- `pipeline` — development branch where forwarding/stalling and interrupt handling were built and verified before merging
 
-- `main` — tracks the current 5-stage pipeline implementation with forwarding, stalling, and BTFNT branch prediction
-- `pipeline` — active development branch
-
-The original single-cycle implementation remains available both in `legacy_singlecycle/` and in the commit history prior to the pipeline merge into `main`.
+The original single-cycle implementation remains in the commit history prior to the pipeline merge.
 
 ---
 

@@ -3,6 +3,7 @@ module result_mux(
 	input [31:0] ALUResult,
 	input [31:0] ReadData,
 	input [31:0] PC_Plus_4,
+	input [31:0] csr_read_val,
 	input [1:0] ResultSrc
 );
 
@@ -11,7 +12,7 @@ always @(*) begin
 		2'b00: Result = ALUResult;
 		2'b01: Result = ReadData;
 		2'b10: Result = PC_Plus_4;
-		2'b11: Result = PC_Plus_4;
+		2'b11: Result = csr_read_val;
 	endcase	
 end
 

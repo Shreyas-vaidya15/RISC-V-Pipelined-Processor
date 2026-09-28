@@ -1,6 +1,6 @@
 module top
 (
-  input clk, reset
+  input clk, reset, interrupt_keyboard, interrupt_disk
 );
 
 // ---- IF stage outputs → IF_ID_reg ----
@@ -16,7 +16,7 @@ wire [31:0] RD1_ID, RD2_ID, ImmExt_ID;
 wire [4:0] WA_ID;
 wire [3:0] ALUControl_ID;
 wire [1:0] ResultSrc_ID;
-wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID;
+wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID, Mret_taken_ID, IsCSR_ID;
 
 // ---- ID_EX_reg outputs → EX_stage / EX_MEM_reg ----
 wire [31:0] PC_EX, PCPlus4_EX, RD1_EX, RD2_EX, ImmExt_EX, Instr_EX;
@@ -24,14 +24,15 @@ wire [4:0] WA_EX;
 wire [3:0] ALUControl_EX;
 wire [2:0] Funct3_EX;
 wire [1:0] Width_EX, ResultSrc_EX;
-wire RegWrite_EX, ALUSrc_EX, MemWrite_EX, Branch_EX, Jump_EX, Predicted_Taken_EX;
+wire RegWrite_EX, ALUSrc_EX, MemWrite_EX, Branch_EX, Jump_EX, Predicted_Taken_EX, IsCSR_EX;
+wire Mret_EX;   // an mret is currently sitting in EX (carried through ID_EX_reg)
 
 // ---- EX_stage outputs → EX_MEM_reg (+ feedback to IF_stage) ----
 wire [31:0] Result_EX, PCTarget_EX, EX_RedirectPC_EX;
 wire IsJalr_EX, EX_Override_EX;
 
 // ---- EX_MEM_reg outputs → MEM_stage / MEM_WB_reg ----
-wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM;
+wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM, csr_read_val_MEM;
 wire [4:0] WA_MEM;
 wire [2:0] Funct3_MEM;
 wire [1:0] Width_MEM, ResultSrc_MEM;
@@ -41,7 +42,7 @@ wire RegWrite_MEM, MemWrite_MEM;
 wire [31:0] ReadData_MEM;
 
 // ---- MEM_WB_reg outputs → result_mux / id_stage feedback ----
-wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB;
+wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB;
 wire [4:0] WA_WB;
 wire [1:0] ResultSrc_WB;
 wire RegWrite_WB;
@@ -54,21 +55,54 @@ assign WA_ID = Instr_ID[11:7];
 
 // ============ FORWARDING WIRES ============
 
-// EX/MEM candidate value: ALUResult for everything except jal/jalr, which need PC+4 instead
 wire [31:0] EX_MEM_Candidate;
-assign EX_MEM_Candidate = (ResultSrc_MEM == 2'b10) ? PCPlus4_MEM : ALUResult_MEM;
+assign EX_MEM_Candidate = (ResultSrc_MEM == 2'b10) ? PCPlus4_MEM :
+                           (ResultSrc_MEM == 2'b11) ? csr_read_val_MEM :
+                           ALUResult_MEM;
 
-// MEM/WB candidate value: reuse Result_WB directly — it's already the fully-resolved
-// write-back value (ALUResult / ReadData / PC+4, correctly selected by result_mux)
-
-// forwarding_unit outputs: which source wins for rs1 (ForwardA) and rs2 (ForwardB)
 wire [1:0] ForwardA, ForwardB;
-
-// forward_mux outputs: the final, correct operand values for EX_stage
 wire [31:0] ForwardedRD1, ForwardedRD2;
 
-//Stall wires
-wire Stall;
+wire Stall_raw;
+wire Stall = Stall_raw & ~Mret_taken_ID;
+
+// ============ INTERRUPT / TRAP WIRES ============
+
+wire [31:0] mepc_val, mcause_val, mtvec_val, pc_mtvec_mcause_val;
+wire mie_val;
+wire [1:0] current_priority_val, previous_priority_val;
+wire pending_keyboard, pending_disk;
+wire [1:0] interrupt_ID;                 // 00 = nobody asking, 01 = keyboard, 10 = disk
+wire interrupt_taken;                    // source-agnostic: the CPU only needs "trap or don't"
+wire interrupt_keyboard_taken, interrupt_disk_taken;   // per-source: used only to clear that source's pending bit
+
+// EX holds a bubble (flush/stall inserted an all-zero instruction). A real instruction is never all zeros.
+// Taking a trap now would save a bogus PC (0) into mepc.
+wire EX_is_bubble = (Instr_EX == 32'b0);
+
+// Someone is actually asking (ID != 00) AND its level is at least the level currently running.
+wire priority_ok = (interrupt_ID != 2'b00) && (interrupt_ID >= current_priority_val);
+
+// Accept a trap only if: interrupts on, priority rule passes,
+// and EX holds neither a bubble nor an mret (mret in EX = return address already redirected; a trap now would overwrite mepc with the mret's own PC).
+assign interrupt_taken = mie_val & priority_ok & ~EX_is_bubble & ~Mret_EX;
+
+// Per-source clears: only the source that was actually served loses its pending bit.
+assign interrupt_disk_taken     = interrupt_taken & (interrupt_ID == 2'b10);
+assign interrupt_keyboard_taken = interrupt_taken & (interrupt_ID == 2'b01);
+
+// Combinational mirror of the cause code mcause.v will latch (same-cycle trap-target math; registered mcause_val lags one cycle).
+wire [31:0] mcause_next = (interrupt_ID == 2'd2) ? {1'b1, 31'd27} : {1'b1, 31'd7};
+
+// A decode-stage mret sitting behind a mispredicted branch is on the wrong path and will be flushed:
+// it must not restore mie / current_priority.
+wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX;
+
+// ============ CSR WIRES ============
+
+wire mepc_write_en, mie_write_en, mcause_write_en, current_priority_write_en, previous_priority_write_en;
+wire [31:0] csr_wdata;
+wire [31:0] csr_read_val_EX;
 
 // ============ INSTANTIATIONS ============
 
@@ -78,7 +112,11 @@ IF_stage IF_stage_inst
     .reset(reset),
     .Stall(Stall),
     .EX_Override(EX_Override_EX),
+    .Mret_taken(Mret_taken_ID),
+    .interrupt_taken(interrupt_taken),
     .EX_RedirectPC(EX_RedirectPC_EX),
+    .mepc(mepc_val),
+    .pc_mtvec_mcause(pc_mtvec_mcause_val),
     .PC(PC_IF),
     .PCPlus4(PCPlus4_IF),
     .Instr(Instr_IF),
@@ -91,6 +129,8 @@ IF_ID_reg IF_ID_reg_inst
     .reset(reset),
     .Flush(EX_Override_EX),
     .Stall(Stall),
+    .Mret_taken(Mret_taken_ID),
+    .interrupt_taken(interrupt_taken),
     .Predicted_Taken_In(Predicted_Taken_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
@@ -113,6 +153,8 @@ ID_stage ID_stage_inst
     .MemWrite(MemWrite_ID),
     .RegWrite(RegWrite_ID),
     .ALUSrc(ALUSrc_ID),
+    .Mret_taken(Mret_taken_ID),
+    .IsCSR(IsCSR_ID),
     .ResultSrc(ResultSrc_ID),
     .ALUControl(ALUControl_ID),
     .rd1(RD1_ID),
@@ -126,6 +168,7 @@ ID_EX_reg ID_EX_reg_inst
     .reset(reset),
     .Flush(EX_Override_EX),
     .Stall(Stall),
+    .interrupt_taken(interrupt_taken),
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
     .RD1_In(RD1_ID),
@@ -141,6 +184,8 @@ ID_EX_reg ID_EX_reg_inst
     .Branch_In(Branch_ID),
     .Jump_In(Jump_ID),
     .Predicted_Taken_In(Predicted_Taken_ID),
+    .IsCSR_In(IsCSR_ID),
+    .Mret_taken_In(Mret_taken_ID),
     .PC_Out(PC_EX),
     .PC_Plus_4_Out(PCPlus4_EX),
     .RD1_Out(RD1_EX),
@@ -157,21 +202,20 @@ ID_EX_reg ID_EX_reg_inst
     .MemWrite_Out(MemWrite_EX),
     .Branch_Out(Branch_EX),
     .Jump_Out(Jump_EX),
-    .Predicted_Taken_Out(Predicted_Taken_EX)
+    .Predicted_Taken_Out(Predicted_Taken_EX),
+    .IsCSR_Out(IsCSR_EX),
+    .Mret_taken_Out(Mret_EX)
 );
 
-//Stall logic
 stall_unit stall_unit_inst
 (
     .ID_EX_opcode(Instr_EX[6:0]),
     .IF_ID_rs1(Instr_ID[19:15]),
     .IF_ID_rs2(Instr_ID[24:20]),
     .ID_EX_WA(WA_EX),
-    .Stall(Stall)
+    .Stall(Stall_raw)
 );
 
-// ---- Forwarding hazard detection: compares ID_EX's rs1/rs2 against
-//      EX_MEM's and MEM_WB's destination registers ----
 forwarding_unit forwarding_unit_inst
 (
     .rs1(Instr_EX[19:15]),
@@ -184,7 +228,6 @@ forwarding_unit forwarding_unit_inst
     .ForwardB(ForwardB)
 );
 
-// ---- rs1 forwarding mux: regfile value vs EX/MEM candidate vs MEM/WB candidate ----
 forward_mux forward_mux_A
 (
     .regfile_rs(RD1_EX),
@@ -194,8 +237,6 @@ forward_mux forward_mux_A
     .final_rs(ForwardedRD1)
 );
 
-// ---- rs2 forwarding mux: feeds both the ALU's B input (via EX_stage) and
-//      EX_MEM_reg.RD2_In (store data path) ----
 forward_mux forward_mux_B
 (
     .regfile_rs(RD2_EX),
@@ -211,6 +252,7 @@ EX_stage EX_stage_inst
     .Branch(Branch_EX),
     .Jump(Jump_EX),
     .Predicted_Taken(Predicted_Taken_EX),
+    .IsCSR(IsCSR_EX),
     .ALUControl(ALUControl_EX),
     .ImmExt(ImmExt_EX),
     .RD1(ForwardedRD1),
@@ -218,6 +260,7 @@ EX_stage EX_stage_inst
     .PC(PC_EX),
     .Instr(Instr_EX),
     .PC_Plus_4(PCPlus4_EX),
+    .csr_read_val(csr_read_val_EX),
     .IsJalr(IsJalr_EX),
     .EX_Override(EX_Override_EX),
     .Result(Result_EX),
@@ -229,9 +272,11 @@ EX_MEM_reg EX_MEM_reg_inst
 (
     .clk(clk),
     .reset(reset),
+    .interrupt_taken(interrupt_taken),
     .PC_Plus_4_In(PCPlus4_EX),
     .ALUResult_In(Result_EX),
     .RD2_In(ForwardedRD2),
+    .csr_read_val_In(csr_read_val_EX),
     .WA_In(WA_EX),
     .Funct3_In(Funct3_EX),
     .Width_In(Width_EX),
@@ -241,6 +286,7 @@ EX_MEM_reg EX_MEM_reg_inst
     .PC_Plus_4_Out(PCPlus4_MEM),
     .ALUResult_Out(ALUResult_MEM),
     .RD2_Out(RD2_MEM),
+    .csr_read_val_Out(csr_read_val_MEM),
     .WA_Out(WA_MEM),
     .Funct3_Out(Funct3_MEM),
     .Width_Out(Width_MEM),
@@ -267,12 +313,14 @@ MEM_WB_reg MEM_WB_reg_inst
     .PC_Plus_4_In(PCPlus4_MEM),
     .ALUResult_In(ALUResult_MEM),
     .ReadData_In(ReadData_MEM),
+    .csr_read_val_In(csr_read_val_MEM),
     .WA_In(WA_MEM),
     .ResultSrc_In(ResultSrc_MEM),
     .RegWrite_In(RegWrite_MEM),
     .PC_Plus_4_Out(PCPlus4_WB),
     .ALUResult_Out(ALUResult_WB),
     .ReadData_Out(ReadData_WB),
+    .csr_read_val_Out(csr_read_val_WB),
     .WA_Out(WA_WB),
     .ResultSrc_Out(ResultSrc_WB),
     .RegWrite_Out(RegWrite_WB)
@@ -284,7 +332,145 @@ result_mux result_mux_inst
     .ALUResult(ALUResult_WB),
     .ReadData(ReadData_WB),
     .PC_Plus_4(PCPlus4_WB),
+    .csr_read_val(csr_read_val_WB),
     .ResultSrc(ResultSrc_WB)
+);
+
+// ---- Interrupt pending latches (each cleared only by its own source being taken) ----
+
+interrupt_latch keyboard_latch_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_in(interrupt_keyboard),
+    .interrupt_taken(interrupt_keyboard_taken),
+    .interrupt_pending(pending_keyboard)
+);
+
+interrupt_latch disk_latch_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_in(interrupt_disk),
+    .interrupt_taken(interrupt_disk_taken),
+    .interrupt_pending(pending_disk)
+);
+
+// ---- Who is asking (highest pending level wins the tie-break) ----
+
+interrupt_priority_encoder interrupt_priority_encoder_inst
+(
+    .pending_keyboard(pending_keyboard),
+    .pending_disk(pending_disk),
+    .interrupt_ID(interrupt_ID)
+);
+
+// ---- Priority level tracking ----
+
+current_priority current_priority_inst
+(
+    .interrupt_ID(interrupt_ID),
+    .csr_wdata(csr_wdata[1:0]),
+    .previous_priority(previous_priority_val),
+    .interrupt_taken(interrupt_taken),
+    .clk(clk),
+    .reset(reset),
+    .current_priority_write_en(current_priority_write_en),
+    .mret_taken(Mret_valid_ID),
+    .current_priority(current_priority_val)
+);
+
+previous_priority previous_priority_inst
+(
+    .current_priority(current_priority_val),
+    .csr_wdata(csr_wdata[1:0]),
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .previous_priority_write_en(previous_priority_write_en),
+    .previous_priority(previous_priority_val)
+);
+
+// ---- CSR / trap logic ----
+
+mepc mepc_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .mepc_write_en(mepc_write_en),
+    .csr_wdata(csr_wdata),
+    .EX_MEPC_IN(PC_EX),
+    .MEPC_OUT(mepc_val)
+);
+
+mcause mcause_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_ID(interrupt_ID),
+    .interrupt_taken(interrupt_taken),
+    .mcause_write_en(mcause_write_en),
+    .csr_wdata(csr_wdata),
+    .mcause(mcause_val)
+);
+
+mtvec mtvec_inst
+(
+    .mtvec(mtvec_val)
+);
+
+pc_mtvec_mcause pc_mtvec_mcause_inst
+(
+    .mtvec(mtvec_val),
+    .mcause(mcause_next),
+    .pc_mtvec_mcause(pc_mtvec_mcause_val)
+);
+
+mie mie_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .mret_taken(Mret_valid_ID),
+    .mie_write_en(mie_write_en),
+    .csr_wdata_b0(csr_wdata[0]),
+    .mie_out(mie_val)
+);
+
+csr_addr_decoder csr_addr_decoder_inst
+(
+    .csr_addr(Instr_EX[31:20]),
+    .IsCSR(IsCSR_EX),
+    .mepc_write_en(mepc_write_en),
+    .mie_write_en(mie_write_en),
+    .mcause_write_en(mcause_write_en),
+    .current_priority_write_en(current_priority_write_en),
+    .previous_priority_write_en(previous_priority_write_en)
+);
+
+csr_write_data csr_write_data_inst
+(
+    .ALUResult(Result_EX),
+    .ImmExt(ImmExt_EX),
+    .rs1(ForwardedRD1),
+    .funct3(Instr_EX[14:12]),
+    .csr_wdata(csr_wdata)
+);
+
+csr_read_data csr_read_data_inst
+(
+    .mepc_write_en(mepc_write_en),
+    .mie_write_en(mie_write_en),
+    .mcause_write_en(mcause_write_en),
+    .current_priority_write_en(current_priority_write_en),
+    .previous_priority_write_en(previous_priority_write_en),
+    .mie_val(mie_val),
+    .mepc_val(mepc_val),
+    .mcause_val(mcause_val),
+    .current_priority(current_priority_val),
+    .previous_priority(previous_priority_val),
+    .csr_read_val(csr_read_val_EX)
 );
 
 endmodule

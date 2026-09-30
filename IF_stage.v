@@ -1,6 +1,6 @@
 module IF_stage
 (
-input clk, reset, Stall, EX_Override, Mret_taken, interrupt_taken,
+input clk, reset, Stall, EX_Override, Mret_taken, interrupt_taken, exception_taken,
 input [31:0] EX_RedirectPC, mepc, pc_mtvec_mcause,
 output [31:0] PC, PCPlus4, Instr,
 output Predicted_Taken
@@ -32,7 +32,8 @@ pc_mux pc_mux_inst(
     .EX_Override(EX_Override),
     .Mret_taken(Mret_taken),
     .interrupt_taken(interrupt_taken),
-    .Predicted_Taken(Predicted_Taken)
+    .Predicted_Taken(Predicted_Taken),
+    .exception_taken(exception_taken)
 );
 
 pc pc_inst(
@@ -42,7 +43,8 @@ pc pc_inst(
     .clk(clk),
     .reset(reset),
     .Stall(Stall),
-    .interrupt_taken(interrupt_taken)
+    .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken)
 );
 
 inst_memory instruction_memory_inst(

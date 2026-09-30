@@ -9,11 +9,14 @@ module main_decoder(
 	output reg Jump,
 	output reg Mret_taken,
 	output reg IsCSR,
+	output reg Illegal_opcode,
 	input [6:0] op,
 	input [2:0] funct3
 );
 
 always @(*) begin
+	Illegal_opcode = 1'b0;
+	
 	case (op)
 
 		7'b0000000: begin
@@ -144,6 +147,7 @@ always @(*) begin
 		       Jump = 1'b0;
 			   Mret_taken = 1'b0;
 			   IsCSR = 1'b0;
+
 	       end
 
 		   7'b1110011: begin
@@ -218,6 +222,7 @@ always @(*) begin
 		       Jump = 1'bx;
 			   Mret_taken = 1'bx;
 			   IsCSR = 1'bx;
+			   Illegal_opcode = 1'b1;
 	       end
 	       endcase
        end

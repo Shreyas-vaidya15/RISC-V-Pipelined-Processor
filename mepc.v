@@ -1,8 +1,8 @@
 module mepc
 (
-    input clk, reset, interrupt_taken, mepc_write_en,
+    input clk, reset, interrupt_taken, mepc_write_en, exception_taken,
     input [31:0] csr_wdata,
-    input [31:0] EX_MEPC_IN,
+    input [31:0] EX_MEPC_IN, ID_MEPC_IN,
     output reg [31:0] MEPC_OUT
 );
 
@@ -20,6 +20,10 @@ begin
 MEPC_OUT <= EX_MEPC_IN;
 end
 
+else if(exception_taken)
+begin
+    MEPC_OUT <= ID_MEPC_IN;
+end
 else if(mepc_write_en)
 begin
 MEPC_OUT <= csr_wdata;

@@ -17,6 +17,7 @@ wire [4:0] WA_ID;
 wire [3:0] ALUControl_ID;
 wire [1:0] ResultSrc_ID;
 wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID, Mret_taken_ID, IsCSR_ID;
+wire Illegal_opcode_ID;   // decoder says the instruction in ID has an unknown opcode
 
 // ---- ID_EX_reg outputs → EX_stage / EX_MEM_reg ----
 wire [31:0] PC_EX, PCPlus4_EX, RD1_EX, RD2_EX, ImmExt_EX, Instr_EX;
@@ -91,8 +92,15 @@ assign interrupt_taken = mie_val & priority_ok & ~EX_is_bubble & ~Mret_EX;
 assign interrupt_disk_taken     = interrupt_taken & (interrupt_ID == 2'b10);
 assign interrupt_keyboard_taken = interrupt_taken & (interrupt_ID == 2'b01);
 
-// Combinational mirror of the cause code mcause.v will latch (same-cycle trap-target math; registered mcause_val lags one cycle).
-wire [31:0] mcause_next = (interrupt_ID == 2'd2) ? {1'b1, 31'd27} : {1'b1, 31'd7};
+// ---- Exception (illegal opcode, detected in ID) ----
+// An interrupt always wins if both happen in the same cycle.
+// ~EX_Override_EX: an illegal-looking instruction behind a mispredicted branch / jump is on the wrong path and gets flushed, so it must not trap.
+wire exception_taken = Illegal_opcode_ID & ~interrupt_taken & ~EX_Override_EX;
+
+// Cause code used for BOTH the trap vector (same cycle) and the mcause register.
+// Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0): 2 = illegal opcode.
+wire [31:0] mcause_next = interrupt_taken ? ((interrupt_ID == 2'd2) ? {1'b1, 31'd27} : {1'b1, 31'd7})
+                                          : {1'b0, 31'd2};
 
 // A decode-stage mret sitting behind a mispredicted branch is on the wrong path and will be flushed:
 // it must not restore mie / current_priority.
@@ -114,6 +122,7 @@ IF_stage IF_stage_inst
     .EX_Override(EX_Override_EX),
     .Mret_taken(Mret_taken_ID),
     .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
     .EX_RedirectPC(EX_RedirectPC_EX),
     .mepc(mepc_val),
     .pc_mtvec_mcause(pc_mtvec_mcause_val),
@@ -131,6 +140,7 @@ IF_ID_reg IF_ID_reg_inst
     .Stall(Stall),
     .Mret_taken(Mret_taken_ID),
     .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
     .Predicted_Taken_In(Predicted_Taken_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
@@ -155,6 +165,7 @@ ID_stage ID_stage_inst
     .ALUSrc(ALUSrc_ID),
     .Mret_taken(Mret_taken_ID),
     .IsCSR(IsCSR_ID),
+    .Illegal_opcode(Illegal_opcode_ID),
     .ResultSrc(ResultSrc_ID),
     .ALUControl(ALUControl_ID),
     .rd1(RD1_ID),
@@ -169,6 +180,7 @@ ID_EX_reg ID_EX_reg_inst
     .Flush(EX_Override_EX),
     .Stall(Stall),
     .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
     .RD1_In(RD1_ID),
@@ -268,6 +280,7 @@ EX_stage EX_stage_inst
     .EX_RedirectPC(EX_RedirectPC_EX)
 );
 
+// EX_MEM_reg flushes on interrupt_taken ONLY: for an exception detected in ID, the instruction in EX is older and must finish.
 EX_MEM_reg EX_MEM_reg_inst
 (
     .clk(clk),
@@ -365,7 +378,7 @@ interrupt_priority_encoder interrupt_priority_encoder_inst
     .interrupt_ID(interrupt_ID)
 );
 
-// ---- Priority level tracking ----
+// ---- Priority level tracking (interrupts only; exceptions do not touch these yet) ----
 
 current_priority current_priority_inst
 (
@@ -398,9 +411,11 @@ mepc mepc_inst
     .clk(clk),
     .reset(reset),
     .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
     .mepc_write_en(mepc_write_en),
     .csr_wdata(csr_wdata),
     .EX_MEPC_IN(PC_EX),
+    .ID_MEPC_IN(PC_ID),
     .MEPC_OUT(mepc_val)
 );
 
@@ -410,6 +425,7 @@ mcause mcause_inst
     .reset(reset),
     .interrupt_ID(interrupt_ID),
     .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
     .mcause_write_en(mcause_write_en),
     .csr_wdata(csr_wdata),
     .mcause(mcause_val)

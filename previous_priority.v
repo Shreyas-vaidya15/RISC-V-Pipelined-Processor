@@ -1,7 +1,7 @@
 module previous_priority
 (
     input [1:0] current_priority, csr_wdata,
-    input clk, reset, interrupt_taken, previous_priority_write_en,
+    input clk, reset, interrupt_taken, previous_priority_write_en, exception_taken, current_priority_write_en,
     output reg [1:0] previous_priority
 );
 
@@ -16,6 +16,11 @@ begin
     else if(interrupt_taken)
     begin
         previous_priority <= current_priority;
+    end
+
+    else if(exception_taken)
+    begin
+        previous_priority <= current_priority_write_en ? csr_wdata : current_priority;
     end
 
     else if(previous_priority_write_en)

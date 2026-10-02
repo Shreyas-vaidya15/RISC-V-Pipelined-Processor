@@ -1,6 +1,6 @@
 module csr_read_data
 (
-    input mepc_write_en, mie_write_en, mcause_write_en, mie_val, current_priority_write_en, previous_priority_write_en,
+    input mepc_write_en, mie_write_en, mcause_write_en, mie_val, current_priority_write_en, previous_priority_write_en, mpie_write_en, mpie_val,
     input [31:0] mepc_val, mcause_val,
     input [1:0] current_priority, previous_priority,
     output reg [31:0] csr_read_val
@@ -14,6 +14,8 @@ begin
     if(mcause_write_en) csr_read_val = mcause_val;
     if(current_priority_write_en) csr_read_val = {30'b0, current_priority};
     if(previous_priority_write_en) csr_read_val = {30'b0, previous_priority};
-end
+    if(mpie_write_en) csr_read_val = {31'b0, mpie_val};
+
+    end
 
 endmodule

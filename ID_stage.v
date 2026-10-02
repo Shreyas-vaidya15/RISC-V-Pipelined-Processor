@@ -3,7 +3,7 @@ module ID_stage
     input clk, we, 
     input [4:0] wa,
     input [31:0] wd, Instr_In,
-    output Jump, Branch, MemWrite, RegWrite, ALUSrc, Mret_taken, IsCSR, Illegal_opcode,
+    output Jump, Branch, MemWrite, RegWrite, ALUSrc, Mret_taken, IsCSR, Illegal_opcode, illegal_funct3_csr, illegal_csr_address, IsLoad,
     output [1:0] ResultSrc,
     output [3:0] ALUControl,
     output [31:0] rd1, rd2, ImmExt
@@ -25,6 +25,8 @@ main_decoder main_decoder_inst
     .Mret_taken(Mret_taken),
     .IsCSR(IsCSR),
     .Illegal_opcode(Illegal_opcode),
+    .illegal_funct3(illegal_funct3_csr),
+    .IsLoad(IsLoad),
     .op(Instr_In[6:0]),
     .funct3(Instr_In[14:12])
 );
@@ -55,5 +57,12 @@ sign_extender sign_extender_inst
     .ImmExt(ImmExt),
     .Instr(Instr_In),
     .ImmSrc(ImmSrc)
+);
+
+illegal_csr_addr illegal_csr_addr_inst
+(
+    .csr_addr(Instr_In[31:20]),
+    .IsCSR(IsCSR),
+    .illegal_csr_address(illegal_csr_address)
 );
 endmodule

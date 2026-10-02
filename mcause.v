@@ -2,11 +2,11 @@ module mcause
 (
     input [31:0] csr_wdata,
     input [1:0] interrupt_ID,
-    input clk, reset, interrupt_taken, mcause_write_en, exception_taken,
+    input clk, reset, interrupt_taken, mcause_write_en, exception_taken, misaligned, misaligned_store,
     output reg [31:0] mcause
 );
 
-wire [31:0] exception_cause_next;
+reg [31:0] exception_cause_next;
 reg [31:0] interrupt_cause_next;
 
 always@(*)
@@ -18,7 +18,26 @@ default : interrupt_cause_next = 32'd0;
 endcase
 end
 
-assign exception_cause_next = 32'd2;
+always@(*)
+begin
+    if(misaligned)
+        begin
+            if(misaligned_store)
+                begin
+                    exception_cause_next = 32'd6;
+                end
+
+            else
+                begin
+                    exception_cause_next = 32'd4;
+                end
+        end
+    else
+        begin
+            exception_cause_next = 32'd2;
+        end
+
+end
 
 always@(posedge clk or posedge reset)
 begin

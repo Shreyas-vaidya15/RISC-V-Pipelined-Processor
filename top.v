@@ -18,6 +18,13 @@ wire [3:0] ALUControl_ID;
 wire [1:0] ResultSrc_ID;
 wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID, Mret_taken_ID, IsCSR_ID;
 wire Illegal_opcode_ID;   // decoder says the instruction in ID has an unknown opcode
+wire illegal_funct7_ID;   // legal opcode, but illegal funct7 field
+wire illegal_funct3_func;
+wire illegal_funct3_csr;
+wire illegal_csr_address_ID;   // CSR instruction with address outside 0-5
+wire illegal_funct3_ID;
+wire IsLoad_ID, IsLoad_EX;   // instruction is a load (needed in EX for the misaligned check, and later for AHB)
+assign illegal_funct3_ID = illegal_funct3_func | illegal_funct3_csr;
 
 // ---- ID_EX_reg outputs → EX_stage / EX_MEM_reg ----
 wire [31:0] PC_EX, PCPlus4_EX, RD1_EX, RD2_EX, ImmExt_EX, Instr_EX;
@@ -71,6 +78,7 @@ wire Stall = Stall_raw & ~Mret_taken_ID;
 
 wire [31:0] mepc_val, mcause_val, mtvec_val, pc_mtvec_mcause_val;
 wire mie_val;
+wire mpie_val;                           // previous mie: saved on trap entry, restored into mie by mret
 wire [1:0] current_priority_val, previous_priority_val;
 wire pending_keyboard, pending_disk;
 wire [1:0] interrupt_ID;                 // 00 = nobody asking, 01 = keyboard, 10 = disk
@@ -92,23 +100,64 @@ assign interrupt_taken = mie_val & priority_ok & ~EX_is_bubble & ~Mret_EX;
 assign interrupt_disk_taken     = interrupt_taken & (interrupt_ID == 2'b10);
 assign interrupt_keyboard_taken = interrupt_taken & (interrupt_ID == 2'b01);
 
-// ---- Exception (illegal opcode, detected in ID) ----
+// ---- Illegal funct3 / funct7 detection (instruction in ID) ----
+illegal_function illegal_function_inst
+(
+    .funct7(Instr_ID[31:25]),
+    .op(Instr_ID[6:0]),
+    .funct3(Instr_ID[14:12]),
+    .illegal_funct7(illegal_funct7_ID),
+    .illegal_funct3(illegal_funct3_func)
+);
+
+// Any of the three illegal-instruction flags raised in ID.
+wire illegal_instr_ID = Illegal_opcode_ID | illegal_funct7_ID | illegal_funct3_ID | illegal_csr_address_ID;
+
+// ---- Exception (illegal opcode / funct7 / funct3, detected in ID) ----
 // An interrupt always wins if both happen in the same cycle.
 // ~EX_Override_EX: an illegal-looking instruction behind a mispredicted branch / jump is on the wrong path and gets flushed, so it must not trap.
-wire exception_taken = Illegal_opcode_ID & ~interrupt_taken & ~EX_Override_EX;
+// ---- Misaligned load/store (detected in EX, from the ALU address) ----
+wire misalign_detect, misalign_is_store;
+
+misaligned_detect misaligned_detect_inst
+(
+    .IsLoad(IsLoad_EX),
+    .MemWrite(MemWrite_EX),
+    .funct3(Funct3_EX),
+    .addr(Result_EX),
+    .misaligned(misalign_detect),
+    .misaligned_store(misalign_is_store)
+);
+
+// Exception raised from EX: the misaligned instruction itself is squashed (like an interrupt).
+// An interrupt in the same cycle wins; the access re-faults after mret.
+wire exception_taken_EX = misalign_detect & ~interrupt_taken;
+
+// Exception raised from ID: the instruction in EX is older and must finish.
+// ~exception_taken_EX: the EX instruction is older than the one in ID, so it traps first.
+wire exception_taken_ID = illegal_instr_ID & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX;
+
+// Source-agnostic: used by everything that only needs "an exception happened" (PC, IF/ID, ID/EX, CSRs).
+wire exception_taken = exception_taken_ID | exception_taken_EX;
+
+// mepc for an exception: the PC of the faulting instruction (EX for misaligned, ID for illegal).
+wire [31:0] exception_mepc = exception_taken_EX ? PC_EX : PC_ID;
 
 // Cause code used for BOTH the trap vector (same cycle) and the mcause register.
-// Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0): 2 = illegal opcode.
+// Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0): 2 = illegal instruction.
+// Exception cause: 6 = store address misaligned, 4 = load address misaligned, 2 = illegal instruction.
+wire [31:0] exception_cause_val = misalign_detect ? (misalign_is_store ? 32'd6 : 32'd4) : 32'd2;
+
 wire [31:0] mcause_next = interrupt_taken ? ((interrupt_ID == 2'd2) ? {1'b1, 31'd27} : {1'b1, 31'd7})
-                                          : {1'b0, 31'd2};
+                                          : exception_cause_val;
 
 // A decode-stage mret sitting behind a mispredicted branch is on the wrong path and will be flushed:
-// it must not restore mie / current_priority.
-wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX;
+// it must not restore mie / mpie / current_priority.
+wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX & ~exception_taken_EX;
 
 // ============ CSR WIRES ============
 
-wire mepc_write_en, mie_write_en, mcause_write_en, current_priority_write_en, previous_priority_write_en;
+wire mepc_write_en, mie_write_en, mcause_write_en, current_priority_write_en, previous_priority_write_en, mpie_write_en;
 wire [31:0] csr_wdata;
 wire [31:0] csr_read_val_EX;
 
@@ -165,7 +214,10 @@ ID_stage ID_stage_inst
     .ALUSrc(ALUSrc_ID),
     .Mret_taken(Mret_taken_ID),
     .IsCSR(IsCSR_ID),
+    .IsLoad(IsLoad_ID),
     .Illegal_opcode(Illegal_opcode_ID),
+    .illegal_funct3_csr(illegal_funct3_csr),
+    .illegal_csr_address(illegal_csr_address_ID),
     .ResultSrc(ResultSrc_ID),
     .ALUControl(ALUControl_ID),
     .rd1(RD1_ID),
@@ -198,6 +250,7 @@ ID_EX_reg ID_EX_reg_inst
     .Predicted_Taken_In(Predicted_Taken_ID),
     .IsCSR_In(IsCSR_ID),
     .Mret_taken_In(Mret_taken_ID),
+    .IsLoad_In(IsLoad_ID),
     .PC_Out(PC_EX),
     .PC_Plus_4_Out(PCPlus4_EX),
     .RD1_Out(RD1_EX),
@@ -216,7 +269,8 @@ ID_EX_reg ID_EX_reg_inst
     .Jump_Out(Jump_EX),
     .Predicted_Taken_Out(Predicted_Taken_EX),
     .IsCSR_Out(IsCSR_EX),
-    .Mret_taken_Out(Mret_EX)
+    .Mret_taken_Out(Mret_EX),
+    .IsLoad_Out(IsLoad_EX)
 );
 
 stall_unit stall_unit_inst
@@ -280,12 +334,14 @@ EX_stage EX_stage_inst
     .EX_RedirectPC(EX_RedirectPC_EX)
 );
 
-// EX_MEM_reg flushes on interrupt_taken ONLY: for an exception detected in ID, the instruction in EX is older and must finish.
+// EX_MEM_reg flushes on an interrupt or an EX-stage exception (the instruction in EX is squashed), NEVER on an ID-stage exception:
+// for an exception detected in ID, the instruction in EX is older and must finish.
 EX_MEM_reg EX_MEM_reg_inst
 (
     .clk(clk),
     .reset(reset),
     .interrupt_taken(interrupt_taken),
+    .exception_taken_EX(exception_taken_EX),
     .PC_Plus_4_In(PCPlus4_EX),
     .ALUResult_In(Result_EX),
     .RD2_In(ForwardedRD2),
@@ -401,6 +457,8 @@ previous_priority previous_priority_inst
     .reset(reset),
     .interrupt_taken(interrupt_taken),
     .previous_priority_write_en(previous_priority_write_en),
+    .exception_taken(exception_taken),
+    .current_priority_write_en(current_priority_write_en),
     .previous_priority(previous_priority_val)
 );
 
@@ -415,7 +473,7 @@ mepc mepc_inst
     .mepc_write_en(mepc_write_en),
     .csr_wdata(csr_wdata),
     .EX_MEPC_IN(PC_EX),
-    .ID_MEPC_IN(PC_ID),
+    .ID_MEPC_IN(exception_mepc),
     .MEPC_OUT(mepc_val)
 );
 
@@ -426,6 +484,8 @@ mcause mcause_inst
     .interrupt_ID(interrupt_ID),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .misaligned(misalign_detect),
+    .misaligned_store(misalign_is_store),
     .mcause_write_en(mcause_write_en),
     .csr_wdata(csr_wdata),
     .mcause(mcause_val)
@@ -443,15 +503,33 @@ pc_mtvec_mcause pc_mtvec_mcause_inst
     .pc_mtvec_mcause(pc_mtvec_mcause_val)
 );
 
+// mie: cleared on ANY trap (interrupt or exception), restored from mpie by a valid mret
 mie mie_inst
 (
     .clk(clk),
     .reset(reset),
     .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
     .mret_taken(Mret_valid_ID),
     .mie_write_en(mie_write_en),
     .csr_wdata_b0(csr_wdata[0]),
+    .mpie_out(mpie_val),
     .mie_out(mie_val)
+);
+
+// mpie: saves mie on ANY trap, set to 1 by a valid mret
+mpie mpie_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .interrupt_taken(interrupt_taken),
+    .exception_taken(exception_taken),
+    .mret_taken(Mret_valid_ID),
+    .mpie_write_en(mpie_write_en),
+    .mie_out(mie_val),
+    .csr_wdata_b0(csr_wdata[0]),
+    .mie_write_en(mie_write_en),
+    .mpie_out(mpie_val)
 );
 
 csr_addr_decoder csr_addr_decoder_inst
@@ -462,7 +540,8 @@ csr_addr_decoder csr_addr_decoder_inst
     .mie_write_en(mie_write_en),
     .mcause_write_en(mcause_write_en),
     .current_priority_write_en(current_priority_write_en),
-    .previous_priority_write_en(previous_priority_write_en)
+    .previous_priority_write_en(previous_priority_write_en),
+    .mpie_write_en(mpie_write_en)
 );
 
 csr_write_data csr_write_data_inst
@@ -481,7 +560,9 @@ csr_read_data csr_read_data_inst
     .mcause_write_en(mcause_write_en),
     .current_priority_write_en(current_priority_write_en),
     .previous_priority_write_en(previous_priority_write_en),
+    .mpie_write_en(mpie_write_en),
     .mie_val(mie_val),
+    .mpie_val(mpie_val),
     .mepc_val(mepc_val),
     .mcause_val(mcause_val),
     .current_priority(current_priority_val),

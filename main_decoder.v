@@ -10,13 +10,17 @@ module main_decoder(
 	output reg Mret_taken,
 	output reg IsCSR,
 	output reg Illegal_opcode,
+	output reg illegal_funct3,
+	output reg IsLoad,
 	input [6:0] op,
 	input [2:0] funct3
 );
 
 always @(*) begin
 	Illegal_opcode = 1'b0;
-	
+	illegal_funct3 = 1'b0;
+	IsLoad = 1'b0;
+
 	case (op)
 
 		7'b0000000: begin
@@ -43,6 +47,7 @@ always @(*) begin
 		       Jump = 1'b0;
 			   Mret_taken = 1'b0;
 			   IsCSR = 1'b0;
+			   IsLoad = 1'b1;
 	       end
 
 	       7'b0100011: begin
@@ -197,31 +202,32 @@ always @(*) begin
 
 			default:
 			begin
-			   RegWrite = 1'bx;
-	   		   ImmSrc = 3'bxxx;
-		       ALUSrc = 1'bx;
-		       MemWrite = 1'bx;
-		       ResultSrc = 2'bxx;
-		       Branch = 1'bx;
-		       ALUop = 3'bxxx;
-		       Jump = 1'bx;
-			   Mret_taken = 1'bx;
-			   IsCSR = 1'bx;
+			   RegWrite = 1'b0;
+	   		   ImmSrc = 3'b000;
+		       ALUSrc = 1'b0;
+		       MemWrite = 1'b0;
+		       ResultSrc = 2'b00;
+		       Branch = 1'b0;
+		       ALUop = 3'b000;
+		       Jump = 1'b0;
+			   Mret_taken = 1'b0;
+			   IsCSR = 1'b0;
+			   illegal_funct3 = 1'b1;
 			end
 			endcase
 		   end
 
 	       default: begin		
-		       RegWrite = 1'bx;
-       		       ImmSrc = 3'bxxx;
-		       ALUSrc = 1'bx;
-		       MemWrite = 1'bx;
-		       ResultSrc = 2'bxx;
-		       Branch = 1'bx;
-		       ALUop = 3'bxxx;
-		       Jump = 1'bx;
-			   Mret_taken = 1'bx;
-			   IsCSR = 1'bx;
+		       RegWrite = 1'b0;
+       		       ImmSrc = 3'b000;
+		       ALUSrc = 1'b0;
+		       MemWrite = 1'b0;
+		       ResultSrc = 2'b00;
+		       Branch = 1'b0;
+		       ALUop = 3'b000;
+		       Jump = 1'b0;
+			   Mret_taken = 1'b0;
+			   IsCSR = 1'b0;
 			   Illegal_opcode = 1'b1;
 	       end
 	       endcase

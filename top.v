@@ -10,6 +10,7 @@ wire Predicted_Taken_IF;
 // ---- IF_ID_reg outputs → ID_stage / ID_EX_reg ----
 wire [31:0] PC_ID, PCPlus4_ID, Instr_ID;
 wire Predicted_Taken_ID;
+wire instruction_access_fault_IF, instruction_access_fault_ID;   // out-of-range fetch: flagged in IF, carried to ID by IF_ID_reg
 
 // ---- ID_stage outputs → ID_EX_reg ----
 wire [31:0] RD1_ID, RD2_ID, ImmExt_ID;
@@ -18,6 +19,8 @@ wire [3:0] ALUControl_ID;
 wire [1:0] ResultSrc_ID;
 wire Jump_ID, Branch_ID, MemWrite_ID, RegWrite_ID, ALUSrc_ID, Mret_taken_ID, IsCSR_ID;
 wire Illegal_opcode_ID;   // decoder says the instruction in ID has an unknown opcode
+wire Illegal_System_Imm_ID;   // SYSTEM opcode, funct3 = 000, but imm is not ecall/ebreak/mret
+wire Ecall_ID, Ebreak_ID;     // ecall (cause 11) / ebreak (cause 3) in ID
 wire illegal_funct7_ID;   // legal opcode, but illegal funct7 field
 wire illegal_funct3_func;
 wire illegal_funct3_csr;
@@ -37,7 +40,7 @@ wire Mret_EX;   // an mret is currently sitting in EX (carried through ID_EX_reg
 
 // ---- EX_stage outputs → EX_MEM_reg (+ feedback to IF_stage) ----
 wire [31:0] Result_EX, PCTarget_EX, EX_RedirectPC_EX;
-wire IsJalr_EX, EX_Override_EX;
+wire IsJalr_EX, EX_Override_EX, Actual_Taken_EX;
 
 // ---- EX_MEM_reg outputs → MEM_stage / MEM_WB_reg ----
 wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM, csr_read_val_MEM;
@@ -111,7 +114,7 @@ illegal_function illegal_function_inst
 );
 
 // Any of the three illegal-instruction flags raised in ID.
-wire illegal_instr_ID = Illegal_opcode_ID | illegal_funct7_ID | illegal_funct3_ID | illegal_csr_address_ID;
+wire illegal_instr_ID = Illegal_opcode_ID | illegal_funct7_ID | illegal_funct3_ID | illegal_csr_address_ID | Illegal_System_Imm_ID;
 
 // ---- Exception (illegal opcode / funct7 / funct3, detected in ID) ----
 // An interrupt always wins if both happen in the same cycle.
@@ -131,11 +134,41 @@ misaligned_detect misaligned_detect_inst
 
 // Exception raised from EX: the misaligned instruction itself is squashed (like an interrupt).
 // An interrupt in the same cycle wins; the access re-faults after mret.
-wire exception_taken_EX = misalign_detect & ~interrupt_taken;
+// Instruction-address-misaligned (cause 0): a taken branch / jal / jalr whose target has bit 1 set.
+wire fetch_misalign_EX;
+
+instruction_address_misalign instruction_address_misalign_inst
+(
+    .Actual_Taken(Actual_Taken_EX),
+    .Branch(Branch_EX),
+    .Jump(Jump_EX),
+    .IsJalr(IsJalr_EX),
+    .ALUResult_b1(Result_EX[1]),
+    .PCTarget_b1(PCTarget_EX[1]),
+    .instruction_address_misalign(fetch_misalign_EX)
+);
+
+// Load/store access fault (cause 5 / 7): address outside the data memory.
+// DATA_DEPTH is in WORDS and must match data_memory's DEPTH (default 64 = 256 bytes).
+localparam DATA_DEPTH = 64;
+wire ls_access_fault_EX;
+
+load_store_access_fault #(.DEPTH(DATA_DEPTH)) load_store_access_fault_inst
+(
+    .IsLoad(IsLoad_EX),
+    .MemWrite(MemWrite_EX),
+    .ALUResult(Result_EX),
+    .load_store_access_fault(ls_access_fault_EX)
+);
+
+wire exception_taken_EX = (misalign_detect | fetch_misalign_EX | ls_access_fault_EX) & ~interrupt_taken;
 
 // Exception raised from ID: the instruction in EX is older and must finish.
 // ~exception_taken_EX: the EX instruction is older than the one in ID, so it traps first.
-wire exception_taken_ID = illegal_instr_ID & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX;
+// ecall / ebreak are raised from ID exactly like an illegal instruction (same gating), only the cause differs.
+// instruction_access_fault_ID: the fetch address was outside the instruction memory (IF swapped in a nop, so the other flags are all 0).
+wire id_exception_pending = illegal_instr_ID | Ecall_ID | Ebreak_ID | instruction_access_fault_ID;
+wire exception_taken_ID = id_exception_pending & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX;
 
 // Source-agnostic: used by everything that only needs "an exception happened" (PC, IF/ID, ID/EX, CSRs).
 wire exception_taken = exception_taken_ID | exception_taken_EX;
@@ -146,7 +179,16 @@ wire [31:0] exception_mepc = exception_taken_EX ? PC_EX : PC_ID;
 // Cause code used for BOTH the trap vector (same cycle) and the mcause register.
 // Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0): 2 = illegal instruction.
 // Exception cause: 6 = store address misaligned, 4 = load address misaligned, 2 = illegal instruction.
-wire [31:0] exception_cause_val = misalign_detect ? (misalign_is_store ? 32'd6 : 32'd4) : 32'd2;
+// ID-sourced cause: 11 = ecall, 3 = ebreak, otherwise 2 = illegal instruction (the flags are mutually exclusive).
+// Must match exception_cause_next in mcause.v.
+wire [31:0] id_cause_val = instruction_access_fault_ID ? 32'd1  :
+                           Ecall_ID                    ? 32'd11 :
+                           Ebreak_ID                   ? 32'd3  :
+                                                         32'd2;
+wire [31:0] exception_cause_val = misalign_detect     ? (misalign_is_store ? 32'd6 : 32'd4) :
+                                  ls_access_fault_EX  ? (IsLoad_EX ? 32'd5 : 32'd7) :
+                                  fetch_misalign_EX   ? 32'd0 :
+                                                        id_cause_val;
 
 wire [31:0] mcause_next = interrupt_taken ? ((interrupt_ID == 2'd2) ? {1'b1, 31'd27} : {1'b1, 31'd7})
                                           : exception_cause_val;
@@ -178,7 +220,8 @@ IF_stage IF_stage_inst
     .PC(PC_IF),
     .PCPlus4(PCPlus4_IF),
     .Instr(Instr_IF),
-    .Predicted_Taken(Predicted_Taken_IF)
+    .Predicted_Taken(Predicted_Taken_IF),
+    .instruction_access_fault(instruction_access_fault_IF)
 );
 
 IF_ID_reg IF_ID_reg_inst
@@ -197,7 +240,9 @@ IF_ID_reg IF_ID_reg_inst
     .Instr_Out(Instr_ID),
     .PC_Out(PC_ID),
     .PC_Plus_4_Out(PCPlus4_ID),
-    .Predicted_Taken_Out(Predicted_Taken_ID)
+    .Predicted_Taken_Out(Predicted_Taken_ID),
+    .instruction_access_fault_In(instruction_access_fault_IF),
+    .instruction_access_fault_Out(instruction_access_fault_ID)
 );
 
 ID_stage ID_stage_inst
@@ -216,6 +261,9 @@ ID_stage ID_stage_inst
     .IsCSR(IsCSR_ID),
     .IsLoad(IsLoad_ID),
     .Illegal_opcode(Illegal_opcode_ID),
+    .Illegal_System_Imm(Illegal_System_Imm_ID),
+    .Ecall(Ecall_ID),
+    .Ebreak(Ebreak_ID),
     .illegal_funct3_csr(illegal_funct3_csr),
     .illegal_csr_address(illegal_csr_address_ID),
     .ResultSrc(ResultSrc_ID),
@@ -329,6 +377,7 @@ EX_stage EX_stage_inst
     .csr_read_val(csr_read_val_EX),
     .IsJalr(IsJalr_EX),
     .EX_Override(EX_Override_EX),
+    .Actual_Taken(Actual_Taken_EX),
     .Result(Result_EX),
     .PCTarget(PCTarget_EX),
     .EX_RedirectPC(EX_RedirectPC_EX)
@@ -364,7 +413,7 @@ EX_MEM_reg EX_MEM_reg_inst
     .MemWrite_Out(MemWrite_MEM)
 );
 
-MEM_stage MEM_stage_inst
+MEM_stage #(.DEPTH(DATA_DEPTH)) MEM_stage_inst
 (
     .clk(clk),
     .MemWrite(MemWrite_MEM),
@@ -486,6 +535,12 @@ mcause mcause_inst
     .exception_taken(exception_taken),
     .misaligned(misalign_detect),
     .misaligned_store(misalign_is_store),
+    .Ecall(Ecall_ID),
+    .Ebreak(Ebreak_ID),
+    .instruction_address_misalign(fetch_misalign_EX),
+    .instruction_access_fault(instruction_access_fault_ID),
+    .load_store_access_fault(ls_access_fault_EX),
+    .IsLoad(IsLoad_EX),
     .mcause_write_en(mcause_write_en),
     .csr_wdata(csr_wdata),
     .mcause(mcause_val)

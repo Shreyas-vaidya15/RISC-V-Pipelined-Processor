@@ -8,7 +8,8 @@ module pc_mux(
     input EX_Override,
     input Mret_taken,
     input interrupt_taken,
-    input Predicted_Taken
+    input Predicted_Taken,
+    input exception_taken
 );
 always @(*) 
 begin
@@ -17,11 +18,16 @@ begin
         PC_Next = pc_mtvec_mcause;
     end
 
+    else if (exception_taken)
+    begin
+        PC_Next = pc_mtvec_mcause;
+    end
+
     else if (EX_Override)
     begin
         PC_Next = EX_RedirectPC;
     end
-    
+
     else if(Mret_taken)
     begin
         PC_Next = mepc;

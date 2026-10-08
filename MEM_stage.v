@@ -1,4 +1,4 @@
-module MEM_stage
+module MEM_stage #(parameter DEPTH = 64)
 (
     input clk, MemWrite,
     input [1:0] Width,
@@ -9,7 +9,7 @@ module MEM_stage
 
 wire [31:0] rdata;
 
-data_memory data_memory_inst
+data_memory #(.DEPTH(DEPTH)) data_memory_inst
 (
     .clk(clk),
     .addr(ALUResult),

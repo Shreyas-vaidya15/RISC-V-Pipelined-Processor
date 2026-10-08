@@ -1,6 +1,6 @@
 module EX_MEM_reg
 (
-    input clk, reset, interrupt_taken,
+    input clk, reset, interrupt_taken, exception_taken_EX,
     input [31:0] PC_Plus_4_In, ALUResult_In, RD2_In, csr_read_val_In,
     input [4:0] WA_In,
     input [2:0] Funct3_In,
@@ -16,7 +16,7 @@ module EX_MEM_reg
 always @(posedge clk or posedge reset)
 begin
 
-    if (reset | interrupt_taken)
+    if (reset | interrupt_taken | exception_taken_EX)
     begin
         PC_Plus_4_Out <= 32'b0;
         ALUResult_Out <= 32'b0;

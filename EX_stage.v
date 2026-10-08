@@ -3,12 +3,12 @@ module EX_stage
     input ALUSrc, Branch, Jump, Predicted_Taken, IsCSR,
     input [3:0] ALUControl,
     input [31:0] ImmExt, RD1, RD2, PC, Instr, PC_Plus_4, csr_read_val,
-    output IsJalr, EX_Override,
+    output IsJalr, EX_Override, Actual_Taken,
     output [31:0] Result, PCTarget,
     output reg [31:0] EX_RedirectPC
 );
 
-wire Zero ,Overflow, Carry, Negative, Mispredict, Actual_Taken;
+wire Zero ,Overflow, Carry, Negative, Mispredict;
 wire [31:0] B;
 
 reg [31:0] A;

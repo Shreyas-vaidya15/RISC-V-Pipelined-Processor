@@ -1,100 +1,331 @@
 module inst_memory #(parameter DEPTH = 256) (input [31:0] addr, output [31:0] data);
 
-// Extra test image for the INSTRUCTION ACCESS FAULT exception (cause 1): the cases the first image did not cover.
-// Instruction memory is 1024 bytes: valid fetch addresses 0..1020 (DEPTH 256 words).
-// Layout (byte addresses):
-//     0         jal x0,200       skip over the handler
-//   100..140    exception handler (mtvec = 100):
-//                 x29 = mcause, x30++ (trap counter), x28 = mepc + 4
-//                 if mcause == 1  -> x28 = x31 (recovery address; mepc+4 would also be out of range)
-//                 mepc = x28, mret
-//   200..       main program, 4 cases (see comments); each cause-1 case sets x31 = where the handler must resume
-//  1016..1020   tail of memory: nop, then lw x16,0(x5)  (CASE 3)
-// Cases:
-//   1  forward branch, predicted NOT taken, really taken to an out-of-range target   -> cause 1, mepc = 1216
-//   2  mret with an out-of-range mepc (2000)                                            -> cause 1, mepc = 2000
-//   4  jal to a target that is out of range AND misaligned (1026)                       -> cause 0 at the jal (mepc = 300), NOT cause 1
-//   3a lw at the last word, misaligned address                                          -> cause 4 (mepc 1020), then cause 1 (mepc 1024)
-//   3b lw at the last word, aligned but out-of-range data address                       -> cause 5 (mepc 1020), then cause 1 (mepc 1024)
-//   3c lw at the last word, valid address: the lw completes (x16 = 1234)                -> cause 1 (mepc 1024)
-// In 3a/3b the out-of-range fetch (1024) is sitting in ID in the SAME cycle as the older lw exception in EX: the older one must win.
-// Expected traps (8, in order): cause 1, cause 1, cause 0, cause 4, cause 1, cause 5, cause 1, cause 1.
-// Case numbers are not in execution order: 1, 2, 4, 3a, 3b, 3c.
-// NOTE: CSR numbers are the current custom ones (mepc = 0, mcause = 2); regenerate the csr fields when you move to the standard addresses.
+// ============================================================================================
+// INTERRUPT SWEEP IMAGE  (pairs with tb_sweep.v)
+//
+// One deterministic program, run many times by the testbench. Each run delivers ONE interrupt pulse
+// (keyboard, disk or both) at a different cycle, and the final registers / data memory / CSRs are compared
+// with a run that had no interrupt. The interrupt handler is transparent: it only touches x23.
+//
+// The program has no exceptions and never reads a CSR whose value a trap would change (mstatus, mepc, mcause,
+// mtval, priorities). It only uses mscratch, misa and mie, so "interrupted run == reference run" must hold.
+//
+// Fixed layout:  0 jal x0,MAIN | 100 jal x0,EXC_H | 144 jal x0,IRQ_H (mtvec reset 0x65, cause 11 -> base+44)
+//                160 IRQ_H: x23++ ; mret        192 EXC_H: x24++ ; mepc += 4 ; mret (never expected to run)
+//                512.. main program
+//
+// Reserved registers: x23 interrupt counter, x24 exception counter, x30 end marker (99), x26 stays 0
+// (it is only written by instructions that must be skipped).
+//
+// What the program covers (an interrupt can land on any of these):
+//   S1  back-to-back ALU forwarding, shifts, slt/sltu, lui
+//   S2  stores/loads of every width, store-to-load, load-use stalls
+//   S3  loops: backward-taken branches (BTFNT predicted taken), loop exit mispredict, load-use inside a loop
+//   S3b every branch type, taken/not taken, forward/backward, mispredicts
+//   S4  jal / jalr, call and return, jalr to a computed address
+//   S5  mscratch csrrw/csrrs/csrrc/csrrsi with the result used at once, misa read
+//   S6  mstatus.MIE = 0 window, then "csrrw mepc ; mret" back to back (a software mret jump)
+// ============================================================================================
 
 reg [7:0] mem [0:DEPTH*4-1];
 
-integer i;
+localparam [31:0] NOP  = 32'h00000013;
+localparam [31:0] MRET = 32'h30200073;
+
+localparam [11:0] CSR_MSTATUS = 12'h300, CSR_MISA = 12'h301, CSR_MIE = 12'h304,
+                  CSR_MSCRATCH = 12'h340, CSR_MEPC = 12'h341;
+
+integer pc, pass, i, k;
+integer n_greg, n_gmem, prog_end;
+
+// ---- golden tables read by the testbench (checked on the reference run) ----
+integer        gold_reg   [0:63];
+reg [31:0]     gold_rval  [0:63];
+reg [8*24-1:0] gold_rname [0:63];
+integer        gold_addr  [0:63];
+reg [31:0]     gold_mval  [0:63];
+
+integer L_main, L_irq, L_exc;
+integer L_l1, L_l2, L_l3, L_b1, L_b2, L_b3, L_b4, L_b5, L_b6, L_fn, L_after, L_mret_t;
+
+// ---- instruction encoders (arguments in assembly order) ----
+function [31:0] CSRRW;  input [4:0] rd; input [11:0] csr; input [4:0] rs1; CSRRW  = {csr, rs1, 3'b001, rd, 7'b1110011}; endfunction
+function [31:0] CSRRS;  input [4:0] rd; input [11:0] csr; input [4:0] rs1; CSRRS  = {csr, rs1, 3'b010, rd, 7'b1110011}; endfunction
+function [31:0] CSRRC;  input [4:0] rd; input [11:0] csr; input [4:0] rs1; CSRRC  = {csr, rs1, 3'b011, rd, 7'b1110011}; endfunction
+function [31:0] CSRRSI; input [4:0] rd; input [11:0] csr; input [4:0] imm; CSRRSI = {csr, imm, 3'b110, rd, 7'b1110011}; endfunction
+function [31:0] ADDI;   input [4:0] rd; input [4:0] rs1; input [11:0] imm; ADDI = {imm, rs1, 3'b000, rd, 7'b0010011}; endfunction
+function [31:0] SLLI;   input [4:0] rd; input [4:0] rs1; input [4:0] sh; SLLI = {7'b0000000, sh, rs1, 3'b001, rd, 7'b0010011}; endfunction
+function [31:0] SRLI;   input [4:0] rd; input [4:0] rs1; input [4:0] sh; SRLI = {7'b0000000, sh, rs1, 3'b101, rd, 7'b0010011}; endfunction
+function [31:0] SRAI;   input [4:0] rd; input [4:0] rs1; input [4:0] sh; SRAI = {7'b0100000, sh, rs1, 3'b101, rd, 7'b0010011}; endfunction
+function [31:0] LUI;    input [4:0] rd; input [19:0] imm; LUI = {imm, rd, 7'b0110111}; endfunction
+function [31:0] AUIPC;  input [4:0] rd; input [19:0] imm; AUIPC = {imm, rd, 7'b0010111}; endfunction
+function [31:0] ADD;    input [4:0] rd; input [4:0] rs1; input [4:0] rs2; ADD  = {7'b0000000, rs2, rs1, 3'b000, rd, 7'b0110011}; endfunction
+function [31:0] SUB;    input [4:0] rd; input [4:0] rs1; input [4:0] rs2; SUB  = {7'b0100000, rs2, rs1, 3'b000, rd, 7'b0110011}; endfunction
+function [31:0] SLT;    input [4:0] rd; input [4:0] rs1; input [4:0] rs2; SLT  = {7'b0000000, rs2, rs1, 3'b010, rd, 7'b0110011}; endfunction
+function [31:0] SLTU;   input [4:0] rd; input [4:0] rs1; input [4:0] rs2; SLTU = {7'b0000000, rs2, rs1, 3'b011, rd, 7'b0110011}; endfunction
+function [31:0] XOR;    input [4:0] rd; input [4:0] rs1; input [4:0] rs2; XOR  = {7'b0000000, rs2, rs1, 3'b100, rd, 7'b0110011}; endfunction
+function [31:0] OR;     input [4:0] rd; input [4:0] rs1; input [4:0] rs2; OR   = {7'b0000000, rs2, rs1, 3'b110, rd, 7'b0110011}; endfunction
+function [31:0] AND;    input [4:0] rd; input [4:0] rs1; input [4:0] rs2; AND  = {7'b0000000, rs2, rs1, 3'b111, rd, 7'b0110011}; endfunction
+function [31:0] LB;     input [4:0] rd; input [11:0] imm; input [4:0] rs1; LB  = {imm, rs1, 3'b000, rd, 7'b0000011}; endfunction
+function [31:0] LH;     input [4:0] rd; input [11:0] imm; input [4:0] rs1; LH  = {imm, rs1, 3'b001, rd, 7'b0000011}; endfunction
+function [31:0] LW;     input [4:0] rd; input [11:0] imm; input [4:0] rs1; LW  = {imm, rs1, 3'b010, rd, 7'b0000011}; endfunction
+function [31:0] LBU;    input [4:0] rd; input [11:0] imm; input [4:0] rs1; LBU = {imm, rs1, 3'b100, rd, 7'b0000011}; endfunction
+function [31:0] LHU;    input [4:0] rd; input [11:0] imm; input [4:0] rs1; LHU = {imm, rs1, 3'b101, rd, 7'b0000011}; endfunction
+function [31:0] SB;     input [4:0] rs2; input [11:0] imm; input [4:0] rs1; SB = {imm[11:5], rs2, rs1, 3'b000, imm[4:0], 7'b0100011}; endfunction
+function [31:0] SH;     input [4:0] rs2; input [11:0] imm; input [4:0] rs1; SH = {imm[11:5], rs2, rs1, 3'b001, imm[4:0], 7'b0100011}; endfunction
+function [31:0] SW;     input [4:0] rs2; input [11:0] imm; input [4:0] rs1; SW = {imm[11:5], rs2, rs1, 3'b010, imm[4:0], 7'b0100011}; endfunction
+function [31:0] JALR;   input [4:0] rd; input [4:0] rs1; input [11:0] imm; JALR = {imm, rs1, 3'b000, rd, 7'b1100111}; endfunction
+
+function [31:0] JALO;   input [4:0] rd; input [31:0] off; JALO = {off[20], off[10:1], off[11], off[19:12], rd, 7'b1101111}; endfunction
+function [31:0] BRO;    input [2:0] f3; input [4:0] rs1; input [4:0] rs2; input [31:0] off;
+    BRO = {off[12], off[10:5], rs2, rs1, f3, off[4:1], off[11], 7'b1100011};
+endfunction
+
+// jump / branch to a label (offset worked out from the current pc)
+function [31:0] JAL;    input [4:0] rd; input [31:0] tgt;
+    reg [31:0] o;
+    begin o = tgt - pc; JAL = JALO(rd, o); end
+endfunction
+function [31:0] BRL;    input [2:0] f3; input [4:0] rs1; input [4:0] rs2; input [31:0] tgt;
+    reg [31:0] o;
+    begin o = tgt - pc; BRL = BRO(f3, rs1, rs2, o); end
+endfunction
+
+// ---- program-building helpers ----
+task emit;
+    input [31:0] w;
+    begin
+        {mem[pc+3], mem[pc+2], mem[pc+1], mem[pc]} = w;
+        pc = pc + 4;
+    end
+endtask
+
+task LI;
+    input [4:0] rd;
+    input [31:0] v;
+    reg [31:0] hi;
+    begin
+        hi = v + 32'h800;
+        emit(LUI(rd, hi[31:12]));
+        emit(ADDI(rd, rd, v[11:0]));
+    end
+endtask
+
+// golden expectations (checked by the testbench on the reference run only)
+task gr;   // register r must hold v at the end
+    input integer r; input [31:0] v; input [8*24-1:0] nm;
+    begin gold_reg[n_greg] = r; gold_rval[n_greg] = v; gold_rname[n_greg] = nm; n_greg = n_greg + 1; end
+endtask
+task gm;   // data memory word at byte address a must hold v at the end
+    input integer a; input [31:0] v;
+    begin gold_addr[n_gmem] = a; gold_mval[n_gmem] = v; n_gmem = n_gmem + 1; end
+endtask
+
+// ============================================================================================
+task build;
+begin
+    n_greg = 0; n_gmem = 0;
+    L_main = 512; L_irq = 160; L_exc = 192;
+
+    // ---- boot and vectors ----
+    pc = 0;   emit(JAL(0, L_main));
+    pc = 100; emit(JAL(0, L_exc));
+    pc = 144; emit(JAL(0, L_irq));
+
+    // ---- interrupt handler: transparent, only x23 ----
+    pc = 160;
+    emit(ADDI(23, 23, 1));
+    emit(MRET);
+
+    // ---- exception handler: should never run (x24 is checked) ----
+    pc = 192;
+    emit(ADDI(24, 24, 1));
+    emit(CSRRS(28, CSR_MEPC, 0));
+    emit(ADDI(28, 28, 4));
+    emit(CSRRW(0, CSR_MEPC, 28));
+    emit(NOP); emit(NOP);
+    emit(MRET);
+
+    // ================= main program =================
+    pc = 512;
+
+    // ---------- S0: enable interrupts (mie[11], then mstatus.MIE) ----------
+    LI(5, 32'h800);
+    emit(CSRRW(0, CSR_MIE, 5));
+    emit(CSRRSI(0, CSR_MSTATUS, 5'd8));
+
+    // ---------- S1: ALU chain, every result feeds the next instruction ----------
+    emit(ADDI(1, 0, 7));
+    emit(ADDI(2, 1, 5));              // 12
+    emit(ADD(3, 1, 2));               // 19
+    emit(SUB(4, 3, 1));               // 12
+    emit(XOR(5, 4, 3));               // 31
+    emit(SLLI(6, 5, 3));              // 248
+    emit(SRLI(7, 6, 1));              // 124
+    emit(LUI(8, 20'h12345));          // 0x12345000
+    emit(ADDI(9, 8, 12'h678));        // 0x12345678
+    emit(OR(10, 9, 7));               // 0x1234567C
+    emit(AND(11, 10, 9));             // 0x12345678
+    emit(ADDI(12, 0, -100));
+    emit(SRAI(13, 12, 2));            // -25
+    emit(SLT(14, 12, 1));             // 1
+    emit(SLTU(15, 12, 1));            // 0
+    gr(3, 32'd19, "x3 add chain");
+    gr(5, 32'd31, "x5 xor");
+    gr(7, 32'd124, "x7 srli");
+    gr(10, 32'h1234567C, "x10 or");
+    gr(11, 32'h12345678, "x11 and");
+    gr(13, 32'hFFFFFFE7, "x13 srai");
+    gr(14, 32'd1, "x14 slt");
+    gr(15, 32'd0, "x15 sltu");
+
+    // ---------- S2: memory, every width, store->load, load-use ----------
+    emit(ADDI(16, 0, 64));
+    emit(SW(10, 0, 16));              // mem[64..67] = 0x1234567C
+    emit(LW(17, 0, 16));
+    emit(ADD(18, 17, 17));            // load-use: 0x2468ACF8
+    emit(SB(3, 5, 16));               // mem[69] = 0x13
+    emit(SH(10, 10, 16));             // mem[74..75] = 0x567C
+    emit(LBU(19, 5, 16));             // 0x13
+    emit(LB(21, 0, 16));              // 0x7C
+    emit(LHU(22, 10, 16));            // 0x567C
+    emit(LH(25, 10, 16));             // 0x567C
+    emit(SB(12, 6, 16));              // mem[70] = 0x9C
+    emit(LB(27, 6, 16));              // 0xFFFFFF9C
+    emit(SH(12, 12, 16));             // mem[76..77] = 0xFF9C
+    emit(LH(31, 12, 16));             // 0xFFFFFF9C
+    emit(ADD(20, 27, 31));            // load-use on x31: 0xFFFFFF38
+    emit(SW(20, 240, 0));
+    gr(17, 32'h1234567C, "x17 lw");
+    gr(18, 32'h2468ACF8, "x18 load-use add");
+    gr(19, 32'h13, "x19 lbu");
+    gr(21, 32'h7C, "x21 lb");
+    gr(22, 32'h567C, "x22 lhu");
+    gr(25, 32'h567C, "x25 lh");
+    gm(240, 32'hFFFFFF38);
+
+    // ---------- S3: loops ----------
+    emit(ADDI(28, 0, 0)); emit(ADDI(29, 0, 10));
+    L_l1 = pc;
+    emit(ADD(28, 28, 29));
+    emit(ADDI(29, 29, -1));
+    emit(BRL(3'b001, 29, 0, L_l1));   // bne, backward: predicted taken, exit is a mispredict
+    emit(SW(28, 200, 0));             // 55
+    gm(200, 32'd55);
+
+    emit(ADDI(27, 0, 128)); emit(ADDI(20, 0, 8)); emit(ADDI(29, 0, 1));
+    L_l2 = pc;
+    emit(SW(29, 0, 27));
+    emit(ADDI(29, 29, 3));
+    emit(ADDI(27, 27, 4));
+    emit(ADDI(20, 20, -1));
+    emit(BRL(3'b001, 20, 0, L_l2));   // array 1,4,7,...,22
+    emit(ADDI(27, 0, 128)); emit(ADDI(20, 0, 8)); emit(ADDI(31, 0, 0));
+    L_l3 = pc;
+    emit(LW(29, 0, 27));
+    emit(ADD(31, 31, 29));            // load-use inside a loop
+    emit(ADDI(27, 27, 4));
+    emit(ADDI(20, 20, -1));
+    emit(BRL(3'b001, 20, 0, L_l3));
+    emit(SW(31, 204, 0));             // 92
+    gm(204, 32'd92);
+
+    // ---------- S3b: every branch type ----------
+    emit(ADDI(28, 0, 0));
+    emit(ADDI(29, 0, 5)); emit(ADDI(20, 0, 5)); emit(ADDI(31, 0, -3));
+    emit(BRL(3'b000, 29, 20, L_b1));  // beq taken (forward, mispredicted)
+    emit(ADDI(28, 28, 100));          // skipped
+    L_b1 = pc;
+    emit(ADDI(28, 28, 1));
+    emit(BRL(3'b001, 29, 20, L_b2));  // bne not taken (forward, predicted right)
+    emit(ADDI(28, 28, 2));
+    L_b2 = pc;
+    emit(BRL(3'b100, 31, 29, L_b3));  // blt taken (-3 < 5)
+    emit(ADDI(28, 28, 200));          // skipped
+    L_b3 = pc;
+    emit(BRL(3'b110, 31, 29, L_b4));  // bltu not taken (0xFFFFFFFD > 5)
+    emit(ADDI(28, 28, 4));
+    L_b4 = pc;
+    emit(BRL(3'b111, 31, 29, L_b5));  // bgeu taken
+    emit(ADDI(28, 28, 300));          // skipped
+    L_b5 = pc;
+    emit(BRL(3'b101, 29, 31, L_b6));  // bge taken (5 >= -3)
+    emit(ADDI(28, 28, 400));          // skipped
+    L_b6 = pc;
+    emit(ADDI(28, 28, 8));
+    emit(BRL(3'b001, 29, 29, L_b6));  // bne x29,x29 backward: predicted taken, never taken
+    emit(ADDI(28, 28, 16));
+    emit(SW(28, 208, 0));             // 1+2+4+8+16 = 31
+    gm(208, 32'd31);
+
+    // ---------- S4: jal / jalr ----------
+    emit(ADDI(29, 0, 0));
+    emit(JAL(20, L_fn));              // call 1
+    emit(JAL(20, L_fn));              // call 2
+    emit(JAL(0, L_after));
+    L_fn = pc;
+    emit(ADDI(29, 29, 10));
+    emit(JALR(0, 20, 0));             // return
+    L_after = pc;
+    emit(SW(29, 212, 0));             // 20
+    gm(212, 32'd20);
+
+    emit(AUIPC(27, 0));               // jalr to a computed address: pc + 16
+    emit(ADDI(27, 27, 16));
+    emit(JALR(0, 27, 0));
+    emit(ADDI(26, 0, 12'hBAD));       // skipped
+    emit(ADDI(28, 0, 77));
+    emit(SW(28, 244, 0));
+    gm(244, 32'd77);
+
+    // ---------- S5: mscratch / misa, CSR result used straight away ----------
+    emit(ADDI(28, 0, 12'h2A5));
+    emit(CSRRW(29, CSR_MSCRATCH, 28));      // x29 = 0
+    emit(CSRRS(20, CSR_MSCRATCH, 0));       // x20 = 0x2A5
+    emit(ADD(31, 20, 28));                  // 0x54A
+    emit(CSRRSI(27, CSR_MSCRATCH, 5'd8));   // x27 = 0x2A5, mscratch = 0x2AD
+    emit(ADDI(28, 0, 15));
+    emit(CSRRC(29, CSR_MSCRATCH, 28));      // x29 = 0x2AD, mscratch = 0x2A0
+    emit(CSRRS(20, CSR_MSCRATCH, 0));       // 0x2A0
+    emit(CSRRS(28, CSR_MISA, 0));           // 0x40000100
+    emit(SW(31, 216, 0)); emit(SW(27, 220, 0)); emit(SW(29, 224, 0)); emit(SW(20, 228, 0)); emit(SW(28, 232, 0));
+    gm(216, 32'h54A); gm(220, 32'h2A5); gm(224, 32'h2AD); gm(228, 32'h2A0); gm(232, 32'h40000100);
+
+    // ---------- S6: MIE = 0 window, then csrrw mepc ; mret back to back ----------
+    // mstatus <- MIE 0, MPIE 1 (so mret leaves MIE = 1, MPIE = 1 whether or not an interrupt happened before).
+    // A pulse that arrives in the window stays pending and is taken right after the mret.
+    emit(ADDI(28, 0, 12'h080));
+    LI(27, L_mret_t);
+    emit(CSRRW(0, CSR_MSTATUS, 28));
+    emit(CSRRW(0, CSR_MEPC, 27));
+    emit(MRET);
+    emit(ADDI(26, 0, 12'hBAD));       // skipped
+    L_mret_t = pc;
+    emit(ADDI(28, 0, 1));
+    emit(SW(28, 236, 0));
+    gm(236, 32'd1);
+
+    // ---------- end ----------
+    emit(ADDI(30, 0, 99));
+    prog_end = pc;
+    emit(JALO(0, 0));                 // park
+
+    gr(24, 32'd0, "no exception ran");
+    gr(26, 32'd0, "skipped instrs not run");
+    gr(30, 32'd99, "end marker");
+
+    if (pass == 1 && pc > 4000) $display("*** inst_memory: main program too long (ends at %0d) ***", pc);
+end
+endtask
+
 initial begin
     for (i = 0; i < DEPTH*4; i = i + 1)
         mem[i] = 8'h00;
 
-    {mem[3], mem[2], mem[1], mem[0]} = 32'h0c80006f;// addr 0: jal x0,200            -- skip over the handler
-    {mem[103], mem[102], mem[101], mem[100]} = 32'h00202ef3;// addr 100: csrrs x29,mcause,x0   -- [HANDLER] x29 = mcause
-    {mem[107], mem[106], mem[105], mem[104]} = 32'h001f0f13;// addr 104: addi x30,x30,1        -- [HANDLER] trap counter++
-    {mem[111], mem[110], mem[109], mem[108]} = 32'h00002e73;// addr 108: csrrs x28,mepc,x0     -- [HANDLER] x28 = mepc
-    {mem[115], mem[114], mem[113], mem[112]} = 32'h004e0e13;// addr 112: addi x28,x28,4        -- [HANDLER] default: skip the trapping instruction
-    {mem[119], mem[118], mem[117], mem[116]} = 32'hfffe8d13;// addr 116: addi x26,x29,-1       -- [HANDLER] x26 = mcause - 1
-    {mem[123], mem[122], mem[121], mem[120]} = 32'h000d1463;// addr 120: bne x26,x0,+8         -- [HANDLER] cause != 1 -> keep mepc+4
-    {mem[127], mem[126], mem[125], mem[124]} = 32'h000f8e13;// addr 124: addi x28,x31,0        -- [HANDLER] cause == 1 -> resume at the recovery address in x31
-    {mem[131], mem[130], mem[129], mem[128]} = 32'h000e1073;// addr 128: csrrw x0,mepc,x28     -- [HANDLER] mepc = x28
-    {mem[135], mem[134], mem[133], mem[132]} = 32'h00000013;// addr 132: nop                   -- [HANDLER] (mepc must be written >= 1 instr before mret)
-    {mem[139], mem[138], mem[137], mem[136]} = 32'h00000013;// addr 136: nop                   -- [HANDLER]
-    {mem[143], mem[142], mem[141], mem[140]} = 32'h30200073;// addr 140: mret                  -- [HANDLER]
-    {mem[203], mem[202], mem[201], mem[200]} = 32'h04d00813;// addr 200: addi x16,x0,77        -- sentinel: a squashed lw must NOT overwrite x16
-    {mem[207], mem[206], mem[205], mem[204]} = 32'h00000013;// addr 204: nop
-    {mem[211], mem[210], mem[209], mem[208]} = 32'h0e800f93;// addr 208: addi x31,x0,232      -- CASE 1: recovery address
-    {mem[215], mem[214], mem[213], mem[212]} = 32'h00000013;// addr 212: nop
-    {mem[219], mem[218], mem[217], mem[216]} = 32'h3e000463;// addr 216: beq x0,x0,+1000       -- CASE 1: forward => predicted NOT taken; really taken to 1216 (out of range) -> mispredict redirect, then TRAP cause 1, mepc=1216
-    {mem[223], mem[222], mem[221], mem[220]} = 32'h00158593;// addr 220: addi x11,x11,1        -- CASE 1 wrong path: must NEVER execute
-    {mem[227], mem[226], mem[225], mem[224]} = 32'h00158593;// addr 224: addi x11,x11,1        -- CASE 1 wrong path: must NEVER execute
-    {mem[231], mem[230], mem[229], mem[228]} = 32'h00158593;// addr 228: addi x11,x11,1        -- CASE 1 wrong path: must NEVER execute
-    {mem[235], mem[234], mem[233], mem[232]} = 32'h001a0a13;// addr 232: addi x20,x20,1        -- CASE 1 marker (recovery point)
-    {mem[239], mem[238], mem[237], mem[236]} = 32'h00000013;// addr 236: nop
-    {mem[243], mem[242], mem[241], mem[240]} = 32'h00000013;// addr 240: nop
-    {mem[247], mem[246], mem[245], mem[244]} = 32'h11800f93;// addr 244: addi x31,x0,280      -- CASE 2: recovery address
-    {mem[251], mem[250], mem[249], mem[248]} = 32'h7d000293;// addr 248: addi x5,x0,2000        -- CASE 2: bad return address (aligned, outside memory)
-    {mem[255], mem[254], mem[253], mem[252]} = 32'h00029073;// addr 252: csrrw x0,mepc,x5       -- CASE 2: mepc = 2000
-    {mem[259], mem[258], mem[257], mem[256]} = 32'h00000013;// addr 256: nop
-    {mem[263], mem[262], mem[261], mem[260]} = 32'h00000013;// addr 260: nop
-    {mem[267], mem[266], mem[265], mem[264]} = 32'h30200073;// addr 264: mret                  -- CASE 2: mret itself completes, then the fetch at 2000 -> TRAP cause 1, mepc=2000
-    {mem[271], mem[270], mem[269], mem[268]} = 32'h00160613;// addr 268: addi x12,x12,1        -- CASE 2 wrong path: must NEVER execute
-    {mem[275], mem[274], mem[273], mem[272]} = 32'h00160613;// addr 272: addi x12,x12,1        -- CASE 2 wrong path: must NEVER execute
-    {mem[279], mem[278], mem[277], mem[276]} = 32'h00160613;// addr 276: addi x12,x12,1        -- CASE 2 wrong path: must NEVER execute
-    {mem[283], mem[282], mem[281], mem[280]} = 32'h001a8a93;// addr 280: addi x21,x21,1        -- CASE 2 marker (recovery point)
-    {mem[287], mem[286], mem[285], mem[284]} = 32'h00000013;// addr 284: nop
-    {mem[291], mem[290], mem[289], mem[288]} = 32'h00000013;// addr 288: nop
-    {mem[295], mem[294], mem[293], mem[292]} = 32'h04d00093;// addr 292: addi x1,x0,77         -- CASE 4: x1 sentinel (the faulting jal must NOT write its link)
-    {mem[299], mem[298], mem[297], mem[296]} = 32'h00000013;// addr 296: nop
-    {mem[303], mem[302], mem[301], mem[300]} = 32'h2d6000ef;// addr 300: jal x1,1026            -- CASE 4: target is out of range AND misaligned -> TRAP cause 0 at the jal, mepc=300 (no fetch happens)
-    {mem[307], mem[306], mem[305], mem[304]} = 32'h001b0b13;// addr 304: addi x22,x22,1        -- CASE 4 marker (handler resumes at jal+4)
-    {mem[311], mem[310], mem[309], mem[308]} = 32'h00000013;// addr 308: nop
-    {mem[315], mem[314], mem[313], mem[312]} = 32'h00000013;// addr 312: nop
-    {mem[319], mem[318], mem[317], mem[316]} = 32'h14800f93;// addr 316: addi x31,x0,328      -- CASE 3a: recovery address
-    {mem[323], mem[322], mem[321], mem[320]} = 32'h10200293;// addr 320: addi x5,x0,258        -- CASE 3a: lw address is misaligned (and out of range): lw traps cause 4 first, then the fetch at 1024 traps cause 1
-    {mem[327], mem[326], mem[325], mem[324]} = 32'h2b40006f;// addr 324: jal x0,1016           -- CASE 3a: run into the tail
-    {mem[331], mem[330], mem[329], mem[328]} = 32'h001b8b93;// addr 328: addi x23,x23,1        -- CASE 3a marker (recovery point)
-    {mem[335], mem[334], mem[333], mem[332]} = 32'h00000013;// addr 332: nop
-    {mem[339], mem[338], mem[337], mem[336]} = 32'h00000013;// addr 336: nop
-    {mem[343], mem[342], mem[341], mem[340]} = 32'h16000f93;// addr 340: addi x31,x0,352      -- CASE 3b: recovery address
-    {mem[347], mem[346], mem[345], mem[344]} = 32'h10000293;// addr 344: addi x5,x0,256        -- CASE 3b: lw address is aligned but out of range: lw traps cause 5 first, then the fetch at 1024 traps cause 1
-    {mem[351], mem[350], mem[349], mem[348]} = 32'h29c0006f;// addr 348: jal x0,1016           -- CASE 3b: run into the tail
-    {mem[355], mem[354], mem[353], mem[352]} = 32'h001c0c13;// addr 352: addi x24,x24,1        -- CASE 3b marker (recovery point)
-    {mem[359], mem[358], mem[357], mem[356]} = 32'h00000013;// addr 356: nop
-    {mem[363], mem[362], mem[361], mem[360]} = 32'h00000013;// addr 360: nop
-    {mem[367], mem[366], mem[365], mem[364]} = 32'h0fc00293;// addr 364: addi x5,x0,252        -- CASE 3c: valid aligned data address
-    {mem[371], mem[370], mem[369], mem[368]} = 32'h4d200313;// addr 368: addi x6,x0,1234       -- CASE 3c: value to load back
-    {mem[375], mem[374], mem[373], mem[372]} = 32'h0062a023;// addr 372: sw x6,0(x5)          -- CASE 3c: mem[252] = 1234
-    {mem[379], mem[378], mem[377], mem[376]} = 32'h18000f93;// addr 376: addi x31,x0,384      -- CASE 3c: recovery address
-    {mem[383], mem[382], mem[381], mem[380]} = 32'h27c0006f;// addr 380: jal x0,1016           -- CASE 3c: run into the tail; lw completes, then TRAP cause 1 at 1024
-    {mem[387], mem[386], mem[385], mem[384]} = 32'h001c8c93;// addr 384: addi x25,x25,1        -- CASE 3c marker (recovery point)
-    {mem[391], mem[390], mem[389], mem[388]} = 32'h00000013;// addr 388: nop
-    {mem[395], mem[394], mem[393], mem[392]} = 32'h00000013;// addr 392: nop
-    {mem[399], mem[398], mem[397], mem[396]} = 32'h3e700793;// addr 396: addi x15,x0,999       -- TRUE END marker
-    {mem[403], mem[402], mem[401], mem[400]} = 32'h0000006f;// addr 400: jal x0,0              -- park here forever
-    {mem[1019], mem[1018], mem[1017], mem[1016]} = 32'h00000013;// addr 1016: nop                   -- CASE 3 tail: last-but-one word (1016)
-    {mem[1023], mem[1022], mem[1021], mem[1020]} = 32'h0002a803;// addr 1020: lw x16,0(x5)          -- CASE 3 tail: LAST valid word (1020); the next fetch (1024) is out of range
+    if (DEPTH < 512) $display("*** inst_memory: this image needs DEPTH >= 512 (tb_sweep.v sets it with a defparam) ***");
 
+    for (pass = 0; pass < 2; pass = pass + 1)
+        build;
 end
 
 assign data = {mem[addr+3], mem[addr+2], mem[addr+1], mem[addr]};

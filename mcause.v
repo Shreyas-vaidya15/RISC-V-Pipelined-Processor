@@ -12,8 +12,7 @@ reg [31:0] interrupt_cause_next;
 always@(*)
 begin
 case(interrupt_ID)
-2'd1 : interrupt_cause_next = {1'b1, 31'd7};
-2'd2 : interrupt_cause_next = {1'b1,31'd27};
+2'd1, 2'd2 : interrupt_cause_next = {1'b1, 31'd11};
 default : interrupt_cause_next = 32'd0;
 endcase
 end

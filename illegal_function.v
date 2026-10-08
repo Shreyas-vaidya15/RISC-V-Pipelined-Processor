@@ -13,10 +13,6 @@ begin
 
     case(op)
 
-    7'b0000000:  // nop / bubble: never illegal
-    begin
-    end
-
     7'b0110011:  // R-type
     begin
         if(funct7 == 7'd32)

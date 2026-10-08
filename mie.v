@@ -9,7 +9,7 @@ begin
 
 if(reset)
 begin
-mie_out <= 1'b1;
+mie_out <= 1'b0;
 end
 
 else if(interrupt_taken | exception_taken)

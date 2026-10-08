@@ -1,6 +1,6 @@
 module ID_EX_reg
 (
-    input clk, reset, Flush, Stall, interrupt_taken, exception_taken,
+    input clk, reset, Flush, Stall, interrupt_taken, exception_taken, Valid_In,
     input [31:0] PC_In, PC_Plus_4_In, RD1_In, RD2_In, ImmExt_In, Instr_In,
     input [4:0] WA_In,
     input [3:0] ALUControl_In,
@@ -11,7 +11,7 @@ module ID_EX_reg
     output reg [3:0] ALUControl_Out,
     output reg [2:0] Funct3_Out,
     output reg [1:0] Width_Out, ResultSrc_Out,
-    output reg RegWrite_Out, ALUSrc_Out, MemWrite_Out, Branch_Out, Jump_Out, Predicted_Taken_Out, IsCSR_Out, Mret_taken_Out, IsLoad_Out
+    output reg RegWrite_Out, ALUSrc_Out, MemWrite_Out, Branch_Out, Jump_Out, Predicted_Taken_Out, IsCSR_Out, Mret_taken_Out, IsLoad_Out, Valid_Out
 );
 
 always @(posedge clk or posedge reset)
@@ -24,7 +24,7 @@ begin
         RD1_Out <= 32'b0;
         RD2_Out <= 32'b0;
         ImmExt_Out <= 32'b0;
-        Instr_Out <= 32'b0;
+        Instr_Out <= 32'h00000013;
         WA_Out <= 5'b0;
         ALUControl_Out <= 4'b0;
         Width_Out <= 2'b0;
@@ -39,6 +39,7 @@ begin
         IsCSR_Out <= 1'b0;
         Mret_taken_Out <= 1'b0;
         IsLoad_Out <= 1'b0;
+        Valid_Out <= 1'b0;
     end
 
     else
@@ -63,6 +64,7 @@ begin
         IsCSR_Out <= IsCSR_In;
         Mret_taken_Out <= Mret_taken_In;
         IsLoad_Out <= IsLoad_In;
+        Valid_Out <= Valid_In;
     end
 end
 

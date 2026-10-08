@@ -29,19 +29,6 @@ always @(*) begin
 	Ebreak = 1'b0;
 	case (op)
 
-		7'b0000000: begin
-		       RegWrite = 1'b0;
-       		       ImmSrc = 3'b000;
-		       ALUSrc = 1'b0;
-		       MemWrite = 1'b0;
-		       ResultSrc = 2'b00;
-		       Branch = 1'b0;
-		       ALUop = 3'b000;
-		       Jump = 1'b0;
-			   Mret_taken = 1'b0;
-			   IsCSR = 1'b0;
-	       end
-
 	       7'b0000011: begin
 		       RegWrite = 1'b1;
        		       ImmSrc = 3'b000;
@@ -161,6 +148,19 @@ always @(*) begin
 
 	       end
 
+		   7'b0001111: begin   
+    			RegWrite = 1'b0;
+    			ImmSrc = 3'b000;
+    			ALUSrc = 1'b0;
+   				MemWrite = 1'b0;
+    			ResultSrc = 2'b00;
+    			Branch = 1'b0;
+    			ALUop = 3'b000;
+    			Jump = 1'b0;
+    			Mret_taken = 1'b0;
+    			IsCSR = 1'b0;
+			end
+
 		   7'b1110011: begin
 			
 			case(funct3)
@@ -209,6 +209,20 @@ always @(*) begin
 		       		Jump = 1'b0;
 			   		Mret_taken = 1'b1;
 			   		IsCSR = 1'b0;
+				end
+
+				12'h105:           
+				begin
+    				RegWrite = 1'b0;
+    				ImmSrc = 3'b000;
+    				ALUSrc = 1'b0;
+    				MemWrite = 1'b0;
+    				ResultSrc = 2'b00;
+   					Branch = 1'b0;
+    				ALUop = 3'b000;
+    				Jump = 1'b0;
+    				Mret_taken = 1'b0;
+    				IsCSR = 1'b0;
 				end
 
 				default:

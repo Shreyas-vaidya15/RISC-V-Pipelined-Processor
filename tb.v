@@ -2,8 +2,9 @@
 
 // ============================================================================================
 // INTERRUPT SWEEP TESTBENCH  (pairs with the "INTERRUPT SWEEP IMAGE" instruction_memory.v)
+// AHB-Lite version: the device under test is soc_top (CPU + AHB data slave).
 //
-// Build (the image is THE instruction memory; leave out the old tb.v):
+// Build (the image is THE instruction memory; leave out the stage 0 tb.v):
 //   iverilog -s tb_sweep -o sim_sweep <all .v files except tb.v> tb_sweep.v
 //   vvp sim_sweep
 //
@@ -14,11 +15,14 @@
 //         and compare against the reference run. The handler is transparent (only x23), so everything
 //         except x23 must match; x23 must equal the number of interrupts expected.
 // Part 3  reset in the middle of a handler: reset k cycles after a trap is taken, check that every
-//         piece of trap state is back at its reset value, then run the whole program again and
-//         compare with the reference run.
+//         piece of trap state (and the AHB slave's saved address phase) is back at its reset value,
+//         then run the whole program again and compare with the reference run.
 //
 // The register file and data memory have no reset in the RTL, so this testbench clears them (hierarchically)
 // every time it resets. Everything else is cleared by the real reset.
+//
+// Stage 1 check: the reference run length must equal the cycle count of the design before the bus change.
+// Put that number in OLD_REF_CYCLES below (0 = just print it, do not check).
 // ============================================================================================
 
 module tb_sweep();
@@ -28,10 +32,11 @@ localparam LIMIT      = 6000;     // cycle limit for one run (hang detection)
 localparam DRAIN      = 30;       // cycles to keep running after the end marker (lets a late pending trap finish)
 localparam EXTRA      = 8;        // sweep this many cycles past the reference end
 localparam MAXPRINT   = 40;       // max failing runs / checks printed in detail
+localparam OLD_REF_CYCLES = 0;    // reference-run length of the design BEFORE the AHB change (0 = do not check)
 
 reg clk, reset, interrupt_keyboard, interrupt_disk;
 
-top top_inst (
+soc_top soc_inst (
     .clk(clk),
     .reset(reset),
     .interrupt_keyboard(interrupt_keyboard),
@@ -39,11 +44,13 @@ top top_inst (
 );
 
 // 4 KB of instruction memory (DEPTH is in words); also moves the instruction_access_fault limit
-defparam top_inst.IF_stage_inst.DEPTH = 1024;
+defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 1024;
 
-`define IM      top_inst.IF_stage_inst.instruction_memory_inst
-`define REG(n)  top_inst.ID_stage_inst.register_file_inst.registers[n]
-`define DMEM(i) top_inst.MEM_stage_inst.data_memory_inst.mem[i]
+`define CPU     soc_inst.cpu_inst
+`define SLAVE   soc_inst.data_slave_inst
+`define IM      soc_inst.cpu_inst.IF_stage_inst.instruction_memory_inst
+`define REG(n)  soc_inst.cpu_inst.ID_stage_inst.register_file_inst.registers[n]
+`define DMEM(i) soc_inst.data_slave_inst.data_memory_inst.mem[i]
 
 initial clk = 1'b0;
 always #5 clk = ~clk;
@@ -75,15 +82,15 @@ reg hit_int  [0:1023];            // word PCs that an interrupt was actually tak
 // ---------------- trap monitor (negedge) ----------------
 always @(negedge clk) begin
     if (!reset) begin
-        if (top_inst.interrupt_taken) begin
+        if (`CPU.interrupt_taken) begin
             irq_cnt = irq_cnt + 1;
-            if (irq_cnt == 1) first_trap_pc = top_inst.PC_EX;
-            hit_int[top_inst.PC_EX[11:2]] = 1'b1;
+            if (irq_cnt == 1) first_trap_pc = `CPU.PC_EX;
+            hit_int[`CPU.PC_EX[11:2]] = 1'b1;
         end
-        if (top_inst.exception_taken)
+        if (`CPU.exception_taken)
             exc_cnt = exc_cnt + 1;
-        if (rec_ref && top_inst.Valid_EX)
-            ref_exec[top_inst.PC_EX[11:2]] = 1'b1;
+        if (rec_ref && `CPU.Valid_EX)
+            ref_exec[`CPU.PC_EX[11:2]] = 1'b1;
     end
 end
 
@@ -110,12 +117,12 @@ task take_snapshot;
     begin
         for (j = 0; j < 32; j = j + 1)          snap_reg[j] = `REG(j);
         for (j = 0; j < DMEM_BYTES; j = j + 1)  snap_mem[j] = `DMEM(j);
-        snap_mscratch = top_inst.mscratch_val;
-        snap_mie_csr  = top_inst.mie_csr_val;
-        snap_mtvec    = top_inst.mtvec_val;
-        snap_mie      = top_inst.mie_val;
-        snap_mpie     = top_inst.mpie_val;
-        snap_cprio    = top_inst.current_priority_val;
+        snap_mscratch = `CPU.mscratch_val;
+        snap_mie_csr  = `CPU.mie_csr_val;
+        snap_mtvec    = `CPU.mtvec_val;
+        snap_mie      = `CPU.mie_val;
+        snap_mpie     = `CPU.mpie_val;
+        snap_cprio    = `CPU.current_priority_val;
     end
 endtask
 
@@ -146,7 +153,6 @@ endtask
 
 // ---------------- compare snapshot with the reference run ----------------
 // exp_traps: number of interrupts that must have been taken in this run
-// tag      : text for the messages
 task compare_to_ref;
     input integer exp_traps;
     input integer kind;
@@ -158,7 +164,7 @@ task compare_to_ref;
         if (hang) begin
             bad = bad + 1;
             if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: HANG, end marker never reached (x30=%0d PC_IF=%0d)",
-                                            kind, N, snap_reg[30], top_inst.PC_IF);
+                                            kind, N, snap_reg[30], `CPU.PC_IF);
         end
 
         if (irq_cnt !== exp_traps) begin
@@ -204,10 +210,16 @@ task compare_to_ref;
         if (snap_cprio !== ref_cprio) begin bad = bad + 1;
             if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: current_priority = %0d, reference %0d", kind, N, snap_cprio, ref_cprio); end
 
-        if (top_inst.pending_keyboard || top_inst.pending_disk) begin
+        if (`CPU.pending_keyboard || `CPU.pending_disk) begin
             bad = bad + 1;
             if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: interrupt still pending at the end (kbd=%b disk=%b)",
-                                            kind, N, top_inst.pending_keyboard, top_inst.pending_disk);
+                                            kind, N, `CPU.pending_keyboard, `CPU.pending_disk);
+        end
+
+        // bus must be idle after the drain (no transfer left in flight)
+        if (`CPU.HTRANS !== 2'b00) begin
+            bad = bad + 1;
+            if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: HTRANS = %b at the end, expected IDLE", kind, N, `CPU.HTRANS);
         end
 
         runs = runs + 1;
@@ -238,7 +250,7 @@ task run_mid_reset;
             interrupt_disk     = (kind == 2 || kind == 3) && (cyc == N);
             @(negedge clk);
             cyc = cyc + 1;
-            if (top_inst.interrupt_taken) got = 1'b1;
+            if (`CPU.interrupt_taken) got = 1'b1;
         end
         interrupt_keyboard = 1'b0;
         interrupt_disk     = 1'b0;
@@ -253,20 +265,24 @@ task run_mid_reset;
         do_reset;     // reset hits while the handler is running
 
         // everything the trap machinery owns must be back at its reset value
-        if (top_inst.PC_IF !== 32'd0)                    begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: PC_IF = %0d after reset", kind, N, k, top_inst.PC_IF); end
-        if (top_inst.mie_val !== 1'b0)                   begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: MIE = %b after reset", kind, N, k, top_inst.mie_val); end
-        if (top_inst.mpie_val !== 1'b0)                  begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: MPIE = %b after reset", kind, N, k, top_inst.mpie_val); end
-        if (top_inst.current_priority_val !== 2'd0)      begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: current_priority = %0d after reset", kind, N, k, top_inst.current_priority_val); end
-        if (top_inst.previous_priority_val !== 2'd0)     begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: previous_priority = %0d after reset", kind, N, k, top_inst.previous_priority_val); end
-        if (top_inst.pending_keyboard || top_inst.pending_disk)
-                                                         begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: pending bit survived reset (kbd=%b disk=%b)", kind, N, k, top_inst.pending_keyboard, top_inst.pending_disk); end
-        if (top_inst.mepc_val !== 32'd0)                 begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mepc = 0x%0h after reset", kind, N, k, top_inst.mepc_val); end
-        if (top_inst.mcause_val !== 32'd0)               begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mcause = 0x%0h after reset", kind, N, k, top_inst.mcause_val); end
-        if (top_inst.mtval_val !== 32'd0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mtval = 0x%0h after reset", kind, N, k, top_inst.mtval_val); end
-        if (top_inst.mtvec_val !== 32'd101)              begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mtvec = 0x%0h after reset, expected 0x65", kind, N, k, top_inst.mtvec_val); end
-        if (top_inst.mie_csr_val !== 32'd0)              begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mie csr = 0x%0h after reset", kind, N, k, top_inst.mie_csr_val); end
-        if (top_inst.mscratch_val !== 32'd0)             begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mscratch = 0x%0h after reset", kind, N, k, top_inst.mscratch_val); end
-        if (top_inst.interrupt_taken !== 1'b0)           begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: interrupt_taken high after reset", kind, N, k); end
+        if (`CPU.PC_IF !== 32'd0)                    begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: PC_IF = %0d after reset", kind, N, k, `CPU.PC_IF); end
+        if (`CPU.mie_val !== 1'b0)                   begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: MIE = %b after reset", kind, N, k, `CPU.mie_val); end
+        if (`CPU.mpie_val !== 1'b0)                  begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: MPIE = %b after reset", kind, N, k, `CPU.mpie_val); end
+        if (`CPU.current_priority_val !== 2'd0)      begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: current_priority = %0d after reset", kind, N, k, `CPU.current_priority_val); end
+        if (`CPU.previous_priority_val !== 2'd0)     begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: previous_priority = %0d after reset", kind, N, k, `CPU.previous_priority_val); end
+        if (`CPU.pending_keyboard || `CPU.pending_disk)
+                                                     begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: pending bit survived reset (kbd=%b disk=%b)", kind, N, k, `CPU.pending_keyboard, `CPU.pending_disk); end
+        if (`CPU.mepc_val !== 32'd0)                 begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mepc = 0x%0h after reset", kind, N, k, `CPU.mepc_val); end
+        if (`CPU.mcause_val !== 32'd0)               begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mcause = 0x%0h after reset", kind, N, k, `CPU.mcause_val); end
+        if (`CPU.mtval_val !== 32'd0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mtval = 0x%0h after reset", kind, N, k, `CPU.mtval_val); end
+        if (`CPU.mtvec_val !== 32'd101)              begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mtvec = 0x%0h after reset, expected 0x65", kind, N, k, `CPU.mtvec_val); end
+        if (`CPU.mie_csr_val !== 32'd0)              begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mie csr = 0x%0h after reset", kind, N, k, `CPU.mie_csr_val); end
+        if (`CPU.mscratch_val !== 32'd0)             begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mscratch = 0x%0h after reset", kind, N, k, `CPU.mscratch_val); end
+        if (`CPU.interrupt_taken !== 1'b0)           begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: interrupt_taken high after reset", kind, N, k); end
+
+        // AHB slave: the saved address phase must be gone (a store caught between its address and data phase is cancelled)
+        if (`SLAVE.valid_dp !== 1'b0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: slave valid_dp = %b after reset", kind, N, k, `SLAVE.valid_dp); end
+        if (`SLAVE.write_dp !== 1'b0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: slave write_dp = %b after reset", kind, N, k, `SLAVE.write_dp); end
 
         errors = errors + bad;
 
@@ -308,9 +324,19 @@ initial begin
 
     if (hang) begin
         errors = errors + 1;
-        $display("  [FAIL] reference run hung (x30=%0d PC_IF=%0d)", snap_reg[30], top_inst.PC_IF);
+        $display("  [FAIL] reference run hung (x30=%0d PC_IF=%0d)", snap_reg[30], `CPU.PC_IF);
     end
     $display("  reference run reached the end marker after %0d cycles", ref_cycles);
+
+    // stage 1: the bus only shifts timing inside the pipeline, so the length must not change
+    if (OLD_REF_CYCLES != 0) begin
+        if (ref_cycles !== OLD_REF_CYCLES) begin
+            errors = errors + 1;
+            $display("  [FAIL] reference run took %0d cycles, the design before the bus change took %0d", ref_cycles, OLD_REF_CYCLES);
+        end
+        else
+            $display("  [ ok ] cycle count unchanged (%0d)", ref_cycles);
+    end
 
     if (irq_cnt !== 0 || exc_cnt !== 0) begin
         errors = errors + 1;
@@ -391,7 +417,7 @@ end
 `ifdef DUMP
 initial begin
     $dumpfile("waves_sweep.vcd");
-    $dumpvars(0, top_inst);
+    $dumpvars(0, soc_inst);
 end
 `endif
 

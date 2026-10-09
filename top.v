@@ -1,6 +1,14 @@
 module top
 (
-  input clk, reset, interrupt_keyboard, interrupt_disk
+  input clk, reset, interrupt_keyboard, interrupt_disk,
+
+  // ---- AHB-Lite master side (data bus) ----
+  input  [31:0] HRDATA,
+  output        HWRITE,
+  output [1:0]  HTRANS,
+  output [2:0]  HSIZE,
+  output [31:0] HADDR,
+  output [31:0] HWDATA
 );
 
 // ---- IF stage outputs → IF_ID_reg ----
@@ -48,16 +56,16 @@ wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM, csr_read_val_MEM;
 wire [4:0] WA_MEM;
 wire [2:0] Funct3_MEM;
 wire [1:0] Width_MEM, ResultSrc_MEM;
-wire RegWrite_MEM, MemWrite_MEM;
+wire RegWrite_MEM, MemWrite_MEM, IsLoad_MEM;
 
-// ---- MEM_stage output → MEM_WB_reg ----
-wire [31:0] ReadData_MEM;
+// ---- (no MEM_stage module any more: the data memory is an AHB slave outside the CPU) ----
 
 // ---- MEM_WB_reg outputs → result_mux / id_stage feedback ----
-wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB;
+wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB, RD2_WB;   // ReadData_WB = load_extend output (HRDATA extended)
 wire [4:0] WA_WB;
 wire [1:0] ResultSrc_WB;
-wire RegWrite_WB;
+wire RegWrite_WB, IsLoad_WB, MemWrite_WB;
+wire [2:0] Funct3_WB;
 
 // ---- result_mux output → id_stage write-back (also doubles as MEM/WB forwarding candidate) ----
 wire [31:0] Result_WB;
@@ -460,6 +468,7 @@ EX_MEM_reg EX_MEM_reg_inst
     .Width_In(Width_EX),
     .ResultSrc_In(ResultSrc_EX),
     .RegWrite_In(RegWrite_EX),
+    .IsLoad_In(IsLoad_EX),
     .MemWrite_In(MemWrite_EX),
     .PC_Plus_4_Out(PCPlus4_MEM),
     .ALUResult_Out(ALUResult_MEM),
@@ -470,18 +479,24 @@ EX_MEM_reg EX_MEM_reg_inst
     .Width_Out(Width_MEM),
     .ResultSrc_Out(ResultSrc_MEM),
     .RegWrite_Out(RegWrite_MEM),
+    .IsLoad_Out(IsLoad_MEM),
     .MemWrite_Out(MemWrite_MEM)
 );
 
-MEM_stage #(.DEPTH(DATA_DEPTH)) MEM_stage_inst
+// Address phase of the bus transfer: driven from the MEM-stage registers.
+// The data phase (HWDATA / HRDATA) happens one cycle later, while the instruction is in WB.
+AHB_master_CPU_interface AHB_master_CPU_interface_inst
 (
-    .clk(clk),
-    .MemWrite(MemWrite_MEM),
-    .Width(Width_MEM),
-    .Funct3(Funct3_MEM),
-    .RD2(RD2_MEM),
-    .ALUResult(ALUResult_MEM),
-    .ReadData(ReadData_MEM)
+    .IsLoad_MEM(IsLoad_MEM),
+    .MemWrite_MEM(MemWrite_MEM),
+    .Width_MEM(Width_MEM),
+    .ALUResult_MEM(ALUResult_MEM),
+    .RD2_WB(RD2_WB),
+    .HWRITE(HWRITE),
+    .HTRANS(HTRANS),
+    .HSIZE(HSIZE),
+    .HADDR(HADDR),
+    .HWDATA(HWDATA)
 );
 
 MEM_WB_reg MEM_WB_reg_inst
@@ -490,18 +505,32 @@ MEM_WB_reg MEM_WB_reg_inst
     .reset(reset),
     .PC_Plus_4_In(PCPlus4_MEM),
     .ALUResult_In(ALUResult_MEM),
-    .ReadData_In(ReadData_MEM),
     .csr_read_val_In(csr_read_val_MEM),
+    .RD2_In(RD2_MEM),
     .WA_In(WA_MEM),
+    .Funct3_In(Funct3_MEM),
     .ResultSrc_In(ResultSrc_MEM),
     .RegWrite_In(RegWrite_MEM),
+    .IsLoad_In(IsLoad_MEM),
+    .MemWrite_In(MemWrite_MEM),
     .PC_Plus_4_Out(PCPlus4_WB),
     .ALUResult_Out(ALUResult_WB),
-    .ReadData_Out(ReadData_WB),
     .csr_read_val_Out(csr_read_val_WB),
+    .RD2_Out(RD2_WB),
     .WA_Out(WA_WB),
+    .Funct3_Out(Funct3_WB),
     .ResultSrc_Out(ResultSrc_WB),
-    .RegWrite_Out(RegWrite_WB)
+    .RegWrite_Out(RegWrite_WB),
+    .IsLoad_Out(IsLoad_WB),
+    .MemWrite_Out(MemWrite_WB)
+);
+
+// Load data arrives from the bus in WB: sign/zero-extend it here.
+load_extend load_extend_inst
+(
+    .Funct3(Funct3_WB),
+    .HRDATA(HRDATA),
+    .ReadData(ReadData_WB)
 );
 
 result_mux result_mux_inst

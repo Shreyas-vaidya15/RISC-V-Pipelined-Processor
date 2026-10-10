@@ -46,7 +46,7 @@ integer        gold_addr  [0:63];
 reg [31:0]     gold_mval  [0:63];
 
 integer L_main, L_irq, L_exc;
-integer L_l1, L_l2, L_l3, L_b1, L_b2, L_b3, L_b4, L_b5, L_b6, L_fn, L_after, L_mret_t;
+integer L_l1, L_l2, L_l3, L_b1, L_b2, L_b3, L_b4, L_b5, L_b6, L_fn, L_after, L_mret_t, L_mret_t2;
 
 // ---- instruction encoders (arguments in assembly order) ----
 function [31:0] CSRRW;  input [4:0] rd; input [11:0] csr; input [4:0] rs1; CSRRW  = {csr, rs1, 3'b001, rd, 7'b1110011}; endfunction
@@ -304,6 +304,55 @@ begin
     emit(ADDI(28, 0, 1));
     emit(SW(28, 236, 0));
     gm(236, 32'd1);
+
+    // ---------- S7: CSR / load-pointer / mret cases placed right behind a memory op ----------
+    // With wait states the memory op sits in WB for several cycles and everything behind it is frozen.
+    // These cases only come out right if a frozen stage acts ONCE (in the last cycle), never once per wait cycle.
+    // The result of each case is stored at once and checked by a golden value, so a wrong value cannot be overwritten unseen.
+    // mscratch is 0x2A0 here (end of S5). x16 is still 64, mem[64] = 0x1234567C (S2).
+
+    // A: csrrw two places behind a store. rd must get the OLD mscratch, not the value written by this same csrrw.
+    emit(ADDI(1, 0, 12'h111));
+    emit(SW(1, 248, 0));                    // the memory op that may wait
+    emit(NOP);
+    emit(CSRRW(20, CSR_MSCRATCH, 1));       // x20 = 0x2A0, mscratch = 0x111
+    emit(SW(20, 252, 0));
+    gm(248, 32'h111); gm(252, 32'h2A0);
+
+    // B: csrrs (read-modify-write) two places behind a load. rd must get the OLD mscratch.
+    emit(ADDI(6, 0, 15));
+    emit(LW(27, 0, 16));                    // the memory op that may wait
+    emit(NOP);
+    emit(CSRRS(28, CSR_MSCRATCH, 6));       // x28 = 0x111, mscratch = 0x11F
+    emit(SW(28, 160, 0));
+    gm(160, 32'h111);
+
+    // C: a loaded pointer used as the address of the very next load. While the first load waits, its data is not valid yet:
+    // the second load (in EX) must not trap or use it until the wait is over.
+    emit(ADDI(8, 0, 168));
+    emit(ADDI(9, 0, 12'h5A5));
+    emit(SW(8, 164, 0));                    // mem[164] = 168 (a pointer)
+    emit(SW(9, 168, 0));                    // mem[168] = 0x5A5
+    emit(LW(29, 164, 0));                   // x29 = 168, may wait
+    emit(LW(31, 0, 29));                    // address comes from the load above
+    emit(SW(31, 172, 0));
+    gm(164, 32'd168); gm(168, 32'h5A5); gm(172, 32'h5A5);
+
+    // D: csrrw mepc ; mret right behind a store that may wait. The mret must update MIE / MPIE only ONCE.
+    // Start with MIE = 0, MPIE = 0: one mret gives MIE = 0, MPIE = 1 (mstatus reads 0x1880). A second mret would give MIE = 1.
+    // MIE stays 0 up to the read, so no interrupt can change what is read. Then MIE is turned on again.
+    LI(12, L_mret_t2);
+    emit(CSRRW(0, CSR_MSTATUS, 0));         // MIE = 0, MPIE = 0
+    emit(SW(9, 176, 0));                    // the memory op that may wait
+    emit(NOP);
+    emit(CSRRW(0, CSR_MEPC, 12));
+    emit(MRET);
+    emit(ADDI(26, 0, 12'hBAD));             // skipped
+    L_mret_t2 = pc;
+    emit(CSRRS(20, CSR_MSTATUS, 0));        // read only: 0x1880
+    emit(SW(20, 180, 0));
+    emit(CSRRSI(0, CSR_MSTATUS, 5'd8));     // MIE = 1 again (MPIE is already 1)
+    gm(176, 32'h5A5); gm(180, 32'h1880);
 
     // ---------- end ----------
     emit(ADDI(30, 0, 99));

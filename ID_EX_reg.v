@@ -1,6 +1,6 @@
 module ID_EX_reg
 (
-    input clk, reset, Flush, Stall, interrupt_taken, exception_taken, Valid_In,
+    input clk, reset, Flush, Stall, interrupt_taken, exception_taken, Valid_In, HREADY,
     input [31:0] PC_In, PC_Plus_4_In, RD1_In, RD2_In, ImmExt_In, Instr_In,
     input [4:0] WA_In,
     input [3:0] ALUControl_In,
@@ -17,7 +17,57 @@ module ID_EX_reg
 always @(posedge clk or posedge reset)
 begin
 
-    if (reset | Flush | Stall | interrupt_taken | exception_taken)
+    if (reset)
+    begin
+        PC_Out <= 32'b0;
+        PC_Plus_4_Out <= 32'b0;
+        RD1_Out <= 32'b0;
+        RD2_Out <= 32'b0;
+        ImmExt_Out <= 32'b0;
+        Instr_Out <= 32'h00000013;
+        WA_Out <= 5'b0;
+        ALUControl_Out <= 4'b0;
+        Width_Out <= 2'b0;
+        ResultSrc_Out <= 2'b0;
+        RegWrite_Out <= 1'b0;
+        ALUSrc_Out <= 1'b0;
+        MemWrite_Out <= 1'b0;
+        Branch_Out <= 1'b0;
+        Jump_Out <= 1'b0;
+        Funct3_Out <= 3'b0;
+        Predicted_Taken_Out <= 1'b0;
+        IsCSR_Out <= 1'b0;
+        Mret_taken_Out <= 1'b0;
+        IsLoad_Out <= 1'b0;
+        Valid_Out <= 1'b0;
+    end
+
+    else if(~HREADY)
+    begin
+        PC_Out <= PC_Out;
+        PC_Plus_4_Out <= PC_Plus_4_Out;
+        RD1_Out <= RD1_Out;
+        RD2_Out <= RD2_Out;
+        ImmExt_Out <= ImmExt_Out;
+        Instr_Out <= Instr_Out;
+        WA_Out <= WA_Out;
+        ALUControl_Out <= ALUControl_Out;
+        Width_Out <= Width_Out;
+        ResultSrc_Out <= ResultSrc_Out;
+        RegWrite_Out <= RegWrite_Out;
+        ALUSrc_Out <= ALUSrc_Out;
+        MemWrite_Out <= MemWrite_Out;
+        Branch_Out <= Branch_Out;
+        Jump_Out <= Jump_Out;
+        Funct3_Out <= Funct3_Out;
+        Predicted_Taken_Out <= Predicted_Taken_Out;
+        IsCSR_Out <= IsCSR_Out;
+        Mret_taken_Out <= Mret_taken_Out;
+        IsLoad_Out <= IsLoad_Out;
+        Valid_Out <= Valid_Out;
+    end
+
+    else if (Flush | Stall | interrupt_taken | exception_taken)
     begin
         PC_Out <= 32'b0;
         PC_Plus_4_Out <= 32'b0;

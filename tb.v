@@ -1,46 +1,54 @@
 `timescale 1ns/1ps
 
 // ============================================================================================
-// INTERRUPT SWEEP TESTBENCH  (pairs with the "INTERRUPT SWEEP IMAGE" instruction_memory.v)
-// AHB-Lite version: the device under test is soc_top (CPU + AHB data slave).
+// INTERRUPT SWEEP TESTBENCH, AHB-Lite version with wait states.  DUT = soc_top (CPU + AHB data slave).
+// Pairs with the "INTERRUPT SWEEP IMAGE" instruction_memory.v.
 //
-// Build (the image is THE instruction memory; leave out the stage 0 tb.v):
-//   iverilog -s tb_sweep -o sim_sweep <all .v files except tb.v> tb_sweep.v
+// Build (leave out any stage 0 slave testbench):
+//   iverilog -s tb_sweep -o sim_sweep <all .v files, one testbench only>
 //   vvp sim_sweep
 //
-// Part 1  reference run: no interrupt. Checked against the image's golden tables (gr / gm),
-//         and its final registers / data memory / CSRs are saved.
-// Part 2  sweep: for each kind (keyboard, disk, both) and each injection cycle N = 0 .. ref_cycles+8,
-//         reset to a fresh state, deliver ONE 1-cycle pulse at cycle N, run to the end marker, drain,
-//         and compare against the reference run. The handler is transparent (only x23), so everything
-//         except x23 must match; x23 must equal the number of interrupts expected.
-// Part 3  reset in the middle of a handler: reset k cycles after a trap is taken, check that every
-//         piece of trap state (and the AHB slave's saved address phase) is back at its reset value,
-//         then run the whole program again and compare with the reference run.
+// The whole test (parts 1-3) is run once per WAIT MODE:
+//   mode 0  no wait states          -> must match the design before wait states: OLD_REF_CYCLES cycles
+//   mode 1  every transfer waits 1 cycle
+//   mode 2  every transfer waits 2 cycles
+//   mode 3  a fixed pseudo-random 0..3 waits per transfer (pattern depends only on the cycle number, so every run
+//           of the mode sees the same wait timeline and the sweep lands interrupts on exactly the reference timeline)
+//
+// Part 1  reference run: no interrupt. Checked against the image's golden tables (gr / gm); final state saved.
+// Part 2  sweep: kind (keyboard, disk, both) x injection cycle N = 0 .. ref_cycles+8: reset, ONE 1-cycle pulse at
+//         cycle N, run to the end marker, drain, compare against the reference run (only x23 may differ).
+// Part 3  reset in the middle of a handler: reset k cycles after a trap, check all trap state + slave state is back
+//         at its reset value, rerun the whole program and compare with the reference run.
+//
+// Always running (every cycle of every run): AHB hold monitor. If HREADY was low in the previous cycle, the master's
+// HADDR / HTRANS / HWRITE / HSIZE / HWDATA must be unchanged in this cycle.
 //
 // The register file and data memory have no reset in the RTL, so this testbench clears them (hierarchically)
-// every time it resets. Everything else is cleared by the real reset.
-//
-// Stage 1 check: the reference run length must equal the cycle count of the design before the bus change.
-// Put that number in OLD_REF_CYCLES below (0 = just print it, do not check).
+// every time it resets.
 // ============================================================================================
 
 module tb_sweep();
 
 localparam DMEM_BYTES = 256;      // data_memory DEPTH (64 words) * 4
-localparam LIMIT      = 6000;     // cycle limit for one run (hang detection)
-localparam DRAIN      = 30;       // cycles to keep running after the end marker (lets a late pending trap finish)
+localparam LIMIT      = 8000;     // cycle limit for one run (hang detection)
+localparam DRAIN      = 40;       // cycles to keep running after the end marker
 localparam EXTRA      = 8;        // sweep this many cycles past the reference end
 localparam MAXPRINT   = 40;       // max failing runs / checks printed in detail
-localparam OLD_REF_CYCLES = 0;    // reference-run length of the design BEFORE the AHB change (0 = do not check)
+localparam OLD_REF_CYCLES = 285;  // reference-run length with 0 wait states (measured on the stage 1 design); 0 = do not check
+localparam NUM_MODES  = 4;
 
 reg clk, reset, interrupt_keyboard, interrupt_disk;
+reg [3:0] wait_cycles;
+integer wait_mode;
+integer cyc;
 
 soc_top soc_inst (
     .clk(clk),
     .reset(reset),
     .interrupt_keyboard(interrupt_keyboard),
-    .interrupt_disk(interrupt_disk)
+    .interrupt_disk(interrupt_disk),
+    .WAIT_CYCLES(wait_cycles)
 );
 
 // 4 KB of instruction memory (DEPTH is in words); also moves the instruction_access_fault limit
@@ -55,12 +63,21 @@ defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 1024;
 initial clk = 1'b0;
 always #5 clk = ~clk;
 
+// ---------------- wait generator: how many wait states the slave gives the next accepted transfer ----------------
+always @(*) begin
+    case (wait_mode)
+        0:       wait_cycles = 4'd0;
+        1:       wait_cycles = 4'd1;
+        2:       wait_cycles = 4'd2;
+        default: wait_cycles = ((cyc * 13) ^ (cyc >> 1)) & 3;     // pseudo-random 0..3, fixed per cycle number
+    endcase
+end
+
 // ---------------- bookkeeping ----------------
 integer errors, warnings, prints;
-integer cyc;
 integer irq_cnt, exc_cnt, first_trap_pc;
-integer ref_cycles;
-integer runs, bad_runs;
+integer ref_cycles, ref0_cycles;
+integer runs, bad_runs, mode_runs0, mode_bad0;
 reg     rec_ref;
 reg     hang;
 
@@ -89,8 +106,40 @@ always @(negedge clk) begin
         end
         if (`CPU.exception_taken)
             exc_cnt = exc_cnt + 1;
-        if (rec_ref && `CPU.Valid_EX)
+        if (rec_ref && `CPU.Valid_EX && `CPU.HREADY)
             ref_exec[`CPU.PC_EX[11:2]] = 1'b1;
+    end
+end
+
+// ---------------- AHB hold monitor (negedge) ----------------
+// If HREADY was low in the previous cycle, nothing the master drives may change in this cycle.
+reg [31:0] pv_haddr, pv_hwdata;
+reg [1:0]  pv_htrans;
+reg [2:0]  pv_hsize;
+reg        pv_hwrite, pv_hready, pv_valid;
+integer    proto_prints;
+initial begin pv_valid = 1'b0; proto_prints = 0; end
+
+always @(negedge clk) begin
+    if (reset) pv_valid = 1'b0;
+    else begin
+        if (pv_valid && !pv_hready) begin
+            if (`CPU.HADDR !== pv_haddr || `CPU.HTRANS !== pv_htrans || `CPU.HWRITE !== pv_hwrite ||
+                `CPU.HSIZE !== pv_hsize || `CPU.HWDATA !== pv_hwdata) begin
+                errors = errors + 1;
+                if (proto_prints < 20)
+                    $display("  [FAIL] mode=%0d: bus signal changed while HREADY was low (HADDR %0h->%0h HTRANS %0b->%0b HWRITE %b->%b HWDATA %0h->%0h)",
+                             wait_mode, pv_haddr, `CPU.HADDR, pv_htrans, `CPU.HTRANS, pv_hwrite, `CPU.HWRITE, pv_hwdata, `CPU.HWDATA);
+                proto_prints = proto_prints + 1;
+            end
+        end
+        pv_haddr  = `CPU.HADDR;
+        pv_hwdata = `CPU.HWDATA;
+        pv_htrans = `CPU.HTRANS;
+        pv_hsize  = `CPU.HSIZE;
+        pv_hwrite = `CPU.HWRITE;
+        pv_hready = `CPU.HREADY;
+        pv_valid  = 1'b1;
     end
 end
 
@@ -106,6 +155,7 @@ task do_reset;
         for (j = 0; j < 32; j = j + 1)          `REG(j)  = 32'b0;
         for (j = 0; j < DMEM_BYTES; j = j + 1)  `DMEM(j) = 8'h00;
         irq_cnt = 0; exc_cnt = 0; first_trap_pc = -1;
+        cyc = 0;
         @(negedge clk);
         @(negedge clk);
     end
@@ -216,10 +266,14 @@ task compare_to_ref;
                                             kind, N, `CPU.pending_keyboard, `CPU.pending_disk);
         end
 
-        // bus must be idle after the drain (no transfer left in flight)
+        // after the drain no transfer may be in flight and the slave must be ready
         if (`CPU.HTRANS !== 2'b00) begin
             bad = bad + 1;
             if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: HTRANS = %b at the end, expected IDLE", kind, N, `CPU.HTRANS);
+        end
+        if (`CPU.HREADY !== 1'b1) begin
+            bad = bad + 1;
+            if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: HREADY low at the end", kind, N);
         end
 
         runs = runs + 1;
@@ -262,7 +316,7 @@ task run_mid_reset;
 
         repeat (k) @(negedge clk);
 
-        do_reset;     // reset hits while the handler is running
+        do_reset;     // reset hits while the handler is running (possibly while the slave is waiting)
 
         // everything the trap machinery owns must be back at its reset value
         if (`CPU.PC_IF !== 32'd0)                    begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: PC_IF = %0d after reset", kind, N, k, `CPU.PC_IF); end
@@ -280,9 +334,11 @@ task run_mid_reset;
         if (`CPU.mscratch_val !== 32'd0)             begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: mscratch = 0x%0h after reset", kind, N, k, `CPU.mscratch_val); end
         if (`CPU.interrupt_taken !== 1'b0)           begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: interrupt_taken high after reset", kind, N, k); end
 
-        // AHB slave: the saved address phase must be gone (a store caught between its address and data phase is cancelled)
+        // AHB slave: saved address phase gone, no wait pending, ready
         if (`SLAVE.valid_dp !== 1'b0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: slave valid_dp = %b after reset", kind, N, k, `SLAVE.valid_dp); end
         if (`SLAVE.write_dp !== 1'b0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: slave write_dp = %b after reset", kind, N, k, `SLAVE.write_dp); end
+        if (`SLAVE.HREADYOUT !== 1'b1)               begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: slave HREADYOUT = %b after reset, expected 1", kind, N, k, `SLAVE.HREADYOUT); end
+        if (`SLAVE.wait_cnt !== 4'd0)                begin bad = bad + 1; $display("  [FAIL] reset-in-handler kind=%0d N=%0d k=%0d: slave wait_cnt = %0d after reset", kind, N, k, `SLAVE.wait_cnt); end
 
         errors = errors + bad;
 
@@ -292,111 +348,141 @@ task run_mid_reset;
     end
 endtask
 
-// ---------------- main ----------------
+// ---------------- the three parts, for one wait mode ----------------
 integer kind, N, k, ni, p, gi, a;
-integer exp_traps;
+integer exp_traps, e0;
 integer cov_total, cov_hit, cov_listed;
 reg [31:0] wv;
+
+task do_mode;
+    input integer mode;
+    begin
+        wait_mode = mode;
+        mode_runs0 = runs; mode_bad0 = bad_runs;
+        for (p = 0; p < 1024; p = p + 1) begin ref_exec[p] = 1'b0; hit_int[p] = 1'b0; end
+
+        $display("=================== wait mode %0d (%0s) ===================", mode,
+                 (mode == 0) ? "no waits" : (mode == 1) ? "1 wait per transfer" : (mode == 2) ? "2 waits per transfer" : "pseudo-random 0..3 waits");
+
+        // ================= Part 1: reference run =================
+        $display("--- Part 1: reference run (no interrupt) ---");
+        e0 = errors;
+        do_reset;
+        rec_ref = 1'b1;
+        run_to_end(0, -1);
+        rec_ref = 1'b0;
+        ref_cycles = cyc;
+        if (mode == 0) ref0_cycles = cyc;
+
+        for (p = 0; p < 32; p = p + 1)          ref_reg[p] = snap_reg[p];
+        for (p = 0; p < DMEM_BYTES; p = p + 1)  ref_mem[p] = snap_mem[p];
+        ref_mscratch = snap_mscratch; ref_mie_csr = snap_mie_csr; ref_mtvec = snap_mtvec;
+        ref_mie = snap_mie; ref_mpie = snap_mpie; ref_cprio = snap_cprio;
+
+        if (hang) begin
+            errors = errors + 1;
+            $display("  [FAIL] reference run hung (x30=%0d PC_IF=%0d)", snap_reg[30], `CPU.PC_IF);
+        end
+        $display("  reference run reached the end marker after %0d cycles", ref_cycles);
+
+        if (mode == 0) begin
+            if (OLD_REF_CYCLES != 0) begin
+                if (ref_cycles !== OLD_REF_CYCLES) begin
+                    errors = errors + 1;
+                    $display("  [FAIL] 0-wait reference run took %0d cycles, expected %0d (design before wait states)", ref_cycles, OLD_REF_CYCLES);
+                end
+                else
+                    $display("  [ ok ] 0-wait cycle count unchanged (%0d)", ref_cycles);
+            end
+        end
+        else begin
+            if (ref_cycles <= ref0_cycles) begin
+                errors = errors + 1;
+                $display("  [FAIL] with waits the run took %0d cycles, not more than the 0-wait run (%0d): waits had no effect", ref_cycles, ref0_cycles);
+            end
+            else
+                $display("  [ ok ] waits lengthened the run: %0d cycles vs %0d with no waits", ref_cycles, ref0_cycles);
+        end
+
+        if (irq_cnt !== 0 || exc_cnt !== 0) begin
+            errors = errors + 1;
+            $display("  [FAIL] reference run took %0d interrupts and %0d exceptions, expected none", irq_cnt, exc_cnt);
+        end
+
+        for (gi = 0; gi < `IM.n_greg; gi = gi + 1) begin
+            if (snap_reg[`IM.gold_reg[gi]] !== `IM.gold_rval[gi]) begin
+                errors = errors + 1;
+                $display("  [FAIL] golden %0s: x%0d = 0x%0h, expected 0x%0h",
+                         `IM.gold_rname[gi], `IM.gold_reg[gi], snap_reg[`IM.gold_reg[gi]], `IM.gold_rval[gi]);
+            end
+        end
+        for (gi = 0; gi < `IM.n_gmem; gi = gi + 1) begin
+            a  = `IM.gold_addr[gi];
+            wv = {snap_mem[a+3], snap_mem[a+2], snap_mem[a+1], snap_mem[a]};
+            if (wv !== `IM.gold_mval[gi]) begin
+                errors = errors + 1;
+                $display("  [FAIL] golden data mem[%0d] = 0x%0h, expected 0x%0h", a, wv, `IM.gold_mval[gi]);
+            end
+        end
+        if (ref_mie !== 1'b1)   begin errors = errors + 1; $display("  [FAIL] reference run: final MIE = %b, expected 1", ref_mie); end
+        if (ref_cprio !== 2'd0) begin errors = errors + 1; $display("  [FAIL] reference run: final current_priority = %0d, expected 0", ref_cprio); end
+        if (errors == e0) $display("  [ ok ] reference run matches all %0d register and %0d memory expectations", `IM.n_greg, `IM.n_gmem);
+
+        // ================= Part 2: the sweep =================
+        $display("--- Part 2: sweep, kinds 1..3, N = 0..%0d ---", ref_cycles + EXTRA);
+        for (kind = 1; kind <= 3; kind = kind + 1) begin
+            exp_traps = (kind == 3) ? 2 : 1;      // both at once: disk first, keyboard right after disk's mret
+            for (N = 0; N <= ref_cycles + EXTRA; N = N + 1) begin
+                do_reset;
+                run_to_end(kind, N);
+                compare_to_ref(exp_traps, kind, N);
+            end
+            $display("  kind %0d done (%0d runs so far in this mode, %0d with failures)", kind, runs - mode_runs0, bad_runs - mode_bad0);
+        end
+
+        // which instructions did an interrupt actually land on?
+        cov_total = 0; cov_hit = 0; cov_listed = 0;
+        for (p = 0; p < 1024; p = p + 1)
+            if (ref_exec[p]) begin
+                cov_total = cov_total + 1;
+                if (hit_int[p]) cov_hit = cov_hit + 1;
+            end
+        $display("  coverage: an interrupt was taken on %0d of the %0d instruction addresses the program executes", cov_hit, cov_total);
+        for (p = 0; p < 1024; p = p + 1)
+            if (ref_exec[p] && !hit_int[p] && cov_listed < 40) begin
+                $display("    never interrupted: pc %0d", p*4);
+                cov_listed = cov_listed + 1;
+            end
+
+        // ================= Part 3: reset in the middle of a handler =================
+        $display("--- Part 3: reset while the handler is running ---");
+        for (kind = 1; kind <= 3; kind = kind + 1)
+            for (ni = 0; ni < 3; ni = ni + 1) begin
+                N = (ni == 0) ? 40 : (ni == 1) ? ref_cycles / 3 : (2 * ref_cycles) / 3;
+                for (k = 0; k <= 14; k = k + 1)
+                    run_mid_reset(kind, N, k);
+            end
+        $display("  reset-in-handler cases done");
+        $display("  mode %0d: %0d runs, %0d with failures", mode, runs - mode_runs0, bad_runs - mode_bad0);
+    end
+endtask
+
+// ---------------- main ----------------
+integer m;
 
 initial begin
     reset = 1'b1;
     interrupt_keyboard = 1'b0;
     interrupt_disk     = 1'b0;
+    wait_mode = 0;
     errors = 0; warnings = 0; prints = 0; runs = 0; bad_runs = 0;
     irq_cnt = 0; exc_cnt = 0; first_trap_pc = -1;
-    cyc = 0; hang = 1'b0; rec_ref = 1'b0;
-    for (p = 0; p < 1024; p = p + 1) begin ref_exec[p] = 1'b0; hit_int[p] = 1'b0; end
+    cyc = 0; hang = 1'b0; rec_ref = 1'b0; ref0_cycles = 0;
 
     #23;
 
-    // ================= Part 1: reference run =================
-    $display("--- Part 1: reference run (no interrupt) ---");
-    do_reset;
-    rec_ref = 1'b1;
-    run_to_end(0, -1);
-    rec_ref = 1'b0;
-    ref_cycles = cyc;
-
-    for (p = 0; p < 32; p = p + 1)          ref_reg[p] = snap_reg[p];
-    for (p = 0; p < DMEM_BYTES; p = p + 1)  ref_mem[p] = snap_mem[p];
-    ref_mscratch = snap_mscratch; ref_mie_csr = snap_mie_csr; ref_mtvec = snap_mtvec;
-    ref_mie = snap_mie; ref_mpie = snap_mpie; ref_cprio = snap_cprio;
-
-    if (hang) begin
-        errors = errors + 1;
-        $display("  [FAIL] reference run hung (x30=%0d PC_IF=%0d)", snap_reg[30], `CPU.PC_IF);
-    end
-    $display("  reference run reached the end marker after %0d cycles", ref_cycles);
-
-    // stage 1: the bus only shifts timing inside the pipeline, so the length must not change
-    if (OLD_REF_CYCLES != 0) begin
-        if (ref_cycles !== OLD_REF_CYCLES) begin
-            errors = errors + 1;
-            $display("  [FAIL] reference run took %0d cycles, the design before the bus change took %0d", ref_cycles, OLD_REF_CYCLES);
-        end
-        else
-            $display("  [ ok ] cycle count unchanged (%0d)", ref_cycles);
-    end
-
-    if (irq_cnt !== 0 || exc_cnt !== 0) begin
-        errors = errors + 1;
-        $display("  [FAIL] reference run took %0d interrupts and %0d exceptions, expected none", irq_cnt, exc_cnt);
-    end
-
-    for (gi = 0; gi < `IM.n_greg; gi = gi + 1) begin
-        if (snap_reg[`IM.gold_reg[gi]] !== `IM.gold_rval[gi]) begin
-            errors = errors + 1;
-            $display("  [FAIL] golden %0s: x%0d = 0x%0h, expected 0x%0h",
-                     `IM.gold_rname[gi], `IM.gold_reg[gi], snap_reg[`IM.gold_reg[gi]], `IM.gold_rval[gi]);
-        end
-    end
-    for (gi = 0; gi < `IM.n_gmem; gi = gi + 1) begin
-        a  = `IM.gold_addr[gi];
-        wv = {snap_mem[a+3], snap_mem[a+2], snap_mem[a+1], snap_mem[a]};
-        if (wv !== `IM.gold_mval[gi]) begin
-            errors = errors + 1;
-            $display("  [FAIL] golden data mem[%0d] = 0x%0h, expected 0x%0h", a, wv, `IM.gold_mval[gi]);
-        end
-    end
-    if (ref_mie !== 1'b1)   begin errors = errors + 1; $display("  [FAIL] reference run: final MIE = %b, expected 1", ref_mie); end
-    if (ref_cprio !== 2'd0) begin errors = errors + 1; $display("  [FAIL] reference run: final current_priority = %0d, expected 0", ref_cprio); end
-    if (errors == 0) $display("  [ ok ] reference run matches all %0d register and %0d memory expectations", `IM.n_greg, `IM.n_gmem);
-
-    // ================= Part 2: the sweep =================
-    $display("--- Part 2: sweep, kinds 1..3, N = 0..%0d ---", ref_cycles + EXTRA);
-    for (kind = 1; kind <= 3; kind = kind + 1) begin
-        exp_traps = (kind == 3) ? 2 : 1;      // both at once: disk first, keyboard right after disk's mret
-        for (N = 0; N <= ref_cycles + EXTRA; N = N + 1) begin
-            do_reset;
-            run_to_end(kind, N);
-            compare_to_ref(exp_traps, kind, N);
-        end
-        $display("  kind %0d done (%0d runs so far, %0d with failures)", kind, runs, bad_runs);
-    end
-
-    // which instructions did an interrupt actually land on?
-    cov_total = 0; cov_hit = 0; cov_listed = 0;
-    for (p = 0; p < 1024; p = p + 1)
-        if (ref_exec[p]) begin
-            cov_total = cov_total + 1;
-            if (hit_int[p]) cov_hit = cov_hit + 1;
-        end
-    $display("  coverage: an interrupt was taken on %0d of the %0d instruction addresses the program executes", cov_hit, cov_total);
-    for (p = 0; p < 1024; p = p + 1)
-        if (ref_exec[p] && !hit_int[p] && cov_listed < 40) begin
-            $display("    never interrupted: pc %0d (expected for the boot jal, the first CSR setup and the MIE=0 window before the software mret)", p*4);
-            cov_listed = cov_listed + 1;
-        end
-
-    // ================= Part 3: reset in the middle of a handler =================
-    $display("--- Part 3: reset while the handler is running ---");
-    for (kind = 1; kind <= 3; kind = kind + 1)
-        for (ni = 0; ni < 3; ni = ni + 1) begin
-            N = (ni == 0) ? 40 : (ni == 1) ? ref_cycles / 3 : (2 * ref_cycles) / 3;
-            for (k = 0; k <= 14; k = k + 1)
-                run_mid_reset(kind, N, k);
-        end
-    $display("  reset-in-handler cases done");
+    for (m = 0; m < NUM_MODES; m = m + 1)
+        do_mode(m);
 
     $display("---FINAL---");
     $display("  %0d runs, %0d with failures, %0d failed checks in total", runs, bad_runs, errors);
@@ -408,7 +494,7 @@ end
 
 // ---------------- watchdog ----------------
 initial begin
-    #2000000000;
+    #5000000000;
     $display("---WATCHDOG FIRED: sweep did not finish---");
     $display("=== %0d CHECK(S) FAILED (hang) ===", errors + 1);
     $finish;
@@ -418,6 +504,7 @@ end
 initial begin
     $dumpfile("waves_sweep.vcd");
     $dumpvars(0, soc_inst);
+    $dumpvars(0, wait_cycles, wait_mode);
 end
 `endif
 

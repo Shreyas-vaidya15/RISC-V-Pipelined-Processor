@@ -1,6 +1,6 @@
 module EX_MEM_reg
 (
-    input clk, reset, interrupt_taken, exception_taken_EX,
+    input clk, reset, interrupt_taken, exception_taken_EX, HREADY,
     input [31:0] PC_Plus_4_In, ALUResult_In, RD2_In, csr_read_val_In,
     input [4:0] WA_In,
     input [2:0] Funct3_In,
@@ -16,7 +16,37 @@ module EX_MEM_reg
 always @(posedge clk or posedge reset)
 begin
 
-    if (reset | interrupt_taken | exception_taken_EX)
+    if (reset)
+    begin
+        PC_Plus_4_Out <= 32'b0;
+        ALUResult_Out <= 32'b0;
+        RD2_Out <= 32'b0;
+        csr_read_val_Out <= 32'b0;
+        WA_Out <= 5'b0;
+        Funct3_Out <= 3'b0;
+        Width_Out <= 2'b0;
+        ResultSrc_Out <= 2'b0;
+        RegWrite_Out <= 1'b0;
+        MemWrite_Out <= 1'b0;
+        IsLoad_Out <= 1'b0;
+    end
+
+    else if(~HREADY)
+    begin
+        PC_Plus_4_Out <= PC_Plus_4_Out;
+        ALUResult_Out <= ALUResult_Out;
+        RD2_Out <= RD2_Out;
+        csr_read_val_Out <= csr_read_val_Out;
+        WA_Out <= WA_Out;
+        Funct3_Out <= Funct3_Out;
+        Width_Out <= Width_Out;
+        ResultSrc_Out <= ResultSrc_Out;
+        RegWrite_Out <= RegWrite_Out;
+        MemWrite_Out <= MemWrite_Out;
+        IsLoad_Out <= IsLoad_Out; 
+    end
+
+    else if (interrupt_taken | exception_taken_EX)
     begin
         PC_Plus_4_Out <= 32'b0;
         ALUResult_Out <= 32'b0;

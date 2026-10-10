@@ -3,6 +3,7 @@ module top
   input clk, reset, interrupt_keyboard, interrupt_disk,
 
   // ---- AHB-Lite master side (data bus) ----
+  input         HREADY,
   input  [31:0] HRDATA,
   output        HWRITE,
   output [1:0]  HTRANS,
@@ -107,7 +108,7 @@ wire priority_ok = (interrupt_ID != 2'b00) && (interrupt_ID > current_priority_v
 
 // Accept a trap only if: interrupts on (mstatus.MIE), external interrupts enabled (mie[11]; keyboard and disk are both external), priority rule passes,
 // and EX holds neither a bubble nor an mret (mret in EX = return address already redirected; a trap now would overwrite mepc with the mret's own PC).
-assign interrupt_taken = mie_val & mie_csr_val[11] & priority_ok & ~EX_is_bubble & ~Mret_EX;
+assign interrupt_taken = mie_val & mie_csr_val[11] & priority_ok & ~EX_is_bubble & ~Mret_EX & HREADY;
 
 // Per-source clears: only the source that was actually served loses its pending bit.
 assign interrupt_disk_taken     = interrupt_taken & (interrupt_ID == 2'b10);
@@ -171,14 +172,14 @@ load_store_access_fault #(.DEPTH(DATA_DEPTH)) load_store_access_fault_inst
     .load_store_access_fault(ls_access_fault_EX)
 );
 
-wire exception_taken_EX = (misalign_detect | fetch_misalign_EX | ls_access_fault_EX) & ~interrupt_taken;
+wire exception_taken_EX = (misalign_detect | fetch_misalign_EX | ls_access_fault_EX) & ~interrupt_taken & HREADY;
 
 // Exception raised from ID: the instruction in EX is older and must finish.
 // ~exception_taken_EX: the EX instruction is older than the one in ID, so it traps first.
 // ecall / ebreak are raised from ID exactly like an illegal instruction (same gating), only the cause differs.
 // instruction_access_fault_ID: the fetch address was outside the instruction memory (IF swapped in a nop, so the other flags are all 0).
 wire id_exception_pending = illegal_instr_ID | Ecall_ID | Ebreak_ID | instruction_access_fault_ID;
-wire exception_taken_ID = id_exception_pending & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX;
+wire exception_taken_ID = id_exception_pending & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX & HREADY;
 
 // Source-agnostic: used by everything that only needs "an exception happened" (PC, IF/ID, ID/EX, CSRs).
 wire exception_taken = exception_taken_ID | exception_taken_EX;
@@ -215,7 +216,7 @@ wire [31:0] mtval_val;
 
 // A decode-stage mret sitting behind a mispredicted branch is on the wrong path and will be flushed:
 // it must not restore mie / mpie / current_priority.
-wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX & ~exception_taken_EX;
+wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX & ~exception_taken_EX & HREADY;
 
 // ============ CSR WIRES ============
 
@@ -229,7 +230,7 @@ wire mepc_sel, mie_sel, mcause_sel, current_priority_sel, previous_priority_sel,
 wire [31:0] mscratch_val, misa_val;
 
 // csrrs/csrrc/csrrsi/csrrci (funct3[1] = 1) with rs1/uimm = 0 only read: they must not write.
-wire csr_write_EX = IsCSR_EX & ~(Instr_EX[13] & (Instr_EX[19:15] == 5'd0));
+wire csr_write_EX = IsCSR_EX & HREADY & ~(Instr_EX[13] & (Instr_EX[19:15] == 5'd0));
 
 assign mepc_write_en              = mepc_sel              & csr_write_EX;
 assign mie_write_en               = mie_sel               & csr_write_EX;
@@ -279,6 +280,7 @@ IF_stage IF_stage_inst
     .Mret_taken(Mret_taken_ID),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .HREADY(HREADY),
     .EX_RedirectPC(EX_RedirectPC_EX),
     .mepc(mepc_for_mret),
     .pc_mtvec_mcause(pc_mtvec_mcause_val),
@@ -298,6 +300,7 @@ IF_ID_reg IF_ID_reg_inst
     .Mret_taken(Mret_taken_ID),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .HREADY(HREADY),
     .Predicted_Taken_In(Predicted_Taken_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
@@ -314,7 +317,7 @@ IF_ID_reg IF_ID_reg_inst
 ID_stage ID_stage_inst
 (
     .clk(clk),
-    .we(RegWrite_WB),
+    .we(RegWrite_WB & HREADY),
     .wa(WA_WB),
     .wd(Result_WB),
     .Instr_In(Instr_ID),
@@ -347,6 +350,7 @@ ID_EX_reg ID_EX_reg_inst
     .Stall(Stall),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .HREADY(HREADY),
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
     .RD1_In(RD1_ID),
@@ -459,6 +463,7 @@ EX_MEM_reg EX_MEM_reg_inst
     .reset(reset),
     .interrupt_taken(interrupt_taken),
     .exception_taken_EX(exception_taken_EX),
+    .HREADY(HREADY),
     .PC_Plus_4_In(PCPlus4_EX),
     .ALUResult_In(Result_EX),
     .RD2_In(ForwardedRD2),
@@ -503,6 +508,7 @@ MEM_WB_reg MEM_WB_reg_inst
 (
     .clk(clk),
     .reset(reset),
+    .HREADY(HREADY),
     .PC_Plus_4_In(PCPlus4_MEM),
     .ALUResult_In(ALUResult_MEM),
     .csr_read_val_In(csr_read_val_MEM),

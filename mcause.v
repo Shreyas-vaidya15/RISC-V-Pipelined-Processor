@@ -2,7 +2,7 @@ module mcause
 (
     input [31:0] csr_wdata,
     input [1:0] interrupt_ID,
-    input clk, reset, interrupt_taken, mcause_write_en, exception_taken, misaligned, misaligned_store, Ecall, Ebreak, instruction_address_misalign, load_store_access_fault, IsLoad, instruction_access_fault,
+    input clk, reset, interrupt_taken, mcause_write_en, exception_taken, misaligned, misaligned_store, Ecall, Ebreak, instruction_address_misalign, instruction_access_fault, bus_error, IsLoad_WB,
     output reg [31:0] mcause
 );
 
@@ -19,7 +19,22 @@ end
 
 always@(*)
 begin
-    if(misaligned)
+    if(bus_error)
+    begin
+
+        if(IsLoad_WB)
+        begin
+            exception_cause_next = 32'd5;
+        end
+
+        else
+        begin
+            exception_cause_next = 32'd7;
+        end
+
+    end
+
+    else if(misaligned)
         begin
             if(misaligned_store)
                 begin
@@ -29,20 +44,6 @@ begin
             else
                 begin
                     exception_cause_next = 32'd4;
-                end
-        end
-
-    else if(load_store_access_fault)
-        begin
-
-            if(IsLoad)
-                begin
-                    exception_cause_next = 32'd5;
-                end
-
-            else
-                begin
-                    exception_cause_next = 32'd7;
                 end
         end
 

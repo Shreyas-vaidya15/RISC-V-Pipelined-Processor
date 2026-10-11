@@ -1,6 +1,16 @@
 module top
 (
-  input clk, reset, interrupt_keyboard, interrupt_disk
+  input clk, reset, interrupt_keyboard, interrupt_disk,
+
+  // ---- AHB-Lite master side (data bus) ----
+  input         HREADY,
+  input         HRESP,
+  input  [31:0] HRDATA,
+  output        HWRITE,
+  output [1:0]  HTRANS,
+  output [2:0]  HSIZE,
+  output [31:0] HADDR,
+  output [31:0] HWDATA
 );
 
 // ---- IF stage outputs → IF_ID_reg ----
@@ -48,16 +58,16 @@ wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM, csr_read_val_MEM;
 wire [4:0] WA_MEM;
 wire [2:0] Funct3_MEM;
 wire [1:0] Width_MEM, ResultSrc_MEM;
-wire RegWrite_MEM, MemWrite_MEM;
+wire RegWrite_MEM, MemWrite_MEM, IsLoad_MEM;
 
-// ---- MEM_stage output → MEM_WB_reg ----
-wire [31:0] ReadData_MEM;
+// ---- (no MEM_stage module any more: the data memory is an AHB slave outside the CPU) ----
 
 // ---- MEM_WB_reg outputs → result_mux / id_stage feedback ----
-wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB;
+wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB, RD2_WB;   // ReadData_WB = load_extend output (HRDATA extended)
 wire [4:0] WA_WB;
 wire [1:0] ResultSrc_WB;
-wire RegWrite_WB;
+wire RegWrite_WB, IsLoad_WB, MemWrite_WB;
+wire [2:0] Funct3_WB;
 
 // ---- result_mux output → id_stage write-back (also doubles as MEM/WB forwarding candidate) ----
 wire [31:0] Result_WB;
@@ -75,8 +85,7 @@ assign EX_MEM_Candidate = (ResultSrc_MEM == 2'b10) ? PCPlus4_MEM :
 wire [1:0] ForwardA, ForwardB;
 wire [31:0] ForwardedRD1, ForwardedRD2;
 
-wire Stall_raw;
-wire Stall = Stall_raw & ~Mret_taken_ID;
+wire Stall_raw;   // load-use hazard from stall_unit; the final Stall (which also includes id_hold) is defined further down
 
 // ============ INTERRUPT / TRAP WIRES ============
 
@@ -97,9 +106,20 @@ wire EX_is_bubble = ~Valid_EX;
 // Someone is actually asking (ID != 00) AND its level is strictly higher than the level currently running.
 wire priority_ok = (interrupt_ID != 2'b00) && (interrupt_ID > current_priority_val);
 
+// Bus error: the slave's ERROR response is in its last cycle (HRESP = 1 and HREADY = 1, state ERR2).
+// The faulting load/store is in WB. Highest priority trap (it is older than anything in EX / ID).
+wire bus_error = HRESP & HREADY;
+
+// A load/store is in MEM: its address phase is on the bus now, and its data phase (and a possible ERROR) comes next cycle.
+wire mem_transfer_MEM = IsLoad_MEM | MemWrite_MEM;
+
+// Interrupt gate: no interrupt while a load/store is in MEM.
+// Otherwise the interrupt would squash the instruction in EX but let this transfer finish, and its bus error
+// would arrive as a second trap right after the interrupt (overwriting mepc / MPIE).
 // Accept a trap only if: interrupts on (mstatus.MIE), external interrupts enabled (mie[11]; keyboard and disk are both external), priority rule passes,
-// and EX holds neither a bubble nor an mret (mret in EX = return address already redirected; a trap now would overwrite mepc with the mret's own PC).
-assign interrupt_taken = mie_val & mie_csr_val[11] & priority_ok & ~EX_is_bubble & ~Mret_EX;
+// EX holds neither a bubble nor an mret (mret in EX = return address already redirected; a trap now would overwrite mepc with the mret's own PC),
+// the bus is ready (a frozen stage acts once), no bus error this cycle, and no load/store in MEM.
+assign interrupt_taken = mie_val & mie_csr_val[11] & priority_ok & ~EX_is_bubble & ~Mret_EX & HREADY & ~bus_error & ~mem_transfer_MEM;
 
 // Per-source clears: only the source that was actually served loses its pending bit.
 assign interrupt_disk_taken     = interrupt_taken & (interrupt_ID == 2'b10);
@@ -118,9 +138,6 @@ illegal_function illegal_function_inst
 // Any of the illegal-instruction flags raised in ID.
 wire illegal_instr_ID = Illegal_opcode_ID | illegal_funct7_ID | illegal_funct3_ID | illegal_csr_address_ID | Illegal_System_Imm_ID;
 
-// ---- Exception (illegal opcode / funct7 / funct3, detected in ID) ----
-// An interrupt always wins if both happen in the same cycle.
-// ~EX_Override_EX: an illegal-looking instruction behind a mispredicted branch / jump is on the wrong path and gets flushed, so it must not trap.
 // ---- Misaligned load/store (detected in EX, from the ALU address) ----
 wire misalign_detect, misalign_is_store;
 
@@ -134,8 +151,6 @@ misaligned_detect misaligned_detect_inst
     .misaligned_store(misalign_is_store)
 );
 
-// Exception raised from EX: the misaligned instruction itself is squashed (like an interrupt).
-// An interrupt in the same cycle wins; the access re-faults after mret.
 // Instruction-address-misaligned (cause 0): a taken branch / jal / jalr whose target has bit 1 set.
 wire fetch_misalign_EX;
 
@@ -150,45 +165,73 @@ instruction_address_misalign instruction_address_misalign_inst
     .instruction_address_misalign(fetch_misalign_EX)
 );
 
-// Load/store access fault (cause 5 / 7): address outside the data memory.
-// DATA_DEPTH is in WORDS and must match data_memory's DEPTH (default 64 = 256 bytes).
-localparam DATA_DEPTH = 64;
-wire ls_access_fault_EX;
+// Load/store access faults (cause 5 / 7) come from the bus ERROR response (bus_error, instruction in WB).
+// There is no address-range check in EX any more: the slave is the only judge of out-of-range addresses.
 
-load_store_access_fault #(.DEPTH(DATA_DEPTH)) load_store_access_fault_inst
-(
-    .IsLoad(IsLoad_EX),
-    .MemWrite(MemWrite_EX),
-    .ALUResult(Result_EX),
-    .load_store_access_fault(ls_access_fault_EX)
-);
+// ============ OLDER-TRANSFER HOLD ============
+// Problem: an exception B (from EX or ID) taken while an OLDER load/store A is in MEM would trap first, and then A's
+// bus error would trap a second time (overwriting mepc, MPIE). Rule: A is older, so A must be allowed to finish first.
+// An interrupt can simply wait, but an exception cannot move on, so while a load/store is in MEM, B waits one cycle:
+//   - exception pending in EX (ex_hold):  B stays in EX. PC, IF_ID and ID_EX freeze (pipe_ready low), EX_MEM takes a bubble
+//                                         so B's own access never reaches the bus. ID_EX_reg also captures B's forwarded
+//                                         operands, because the instruction that supplied them leaves the pipeline.
+//   - exception pending in ID (id_hold):  B stays in ID. Treated like the load-use Stall: PC and IF_ID freeze,
+//                                         ID_EX takes a bubble. The older instruction in EX moves on normally.
+// Next cycle A is in WB. If A errors, bus_error traps for A and squashes B (B re-runs after mret). If not, B traps normally.
+// Cannot deadlock: after the hold, MEM holds a bubble (or the older instruction, which is not stuck either), so the gate turns off.
+// While HREADY is low everything is frozen anyway, so the hold only matters when HREADY = 1. bus_error: A traps now, no hold needed.
+wire ex_exc_pending = misalign_detect | fetch_misalign_EX;
 
-wire exception_taken_EX = (misalign_detect | fetch_misalign_EX | ls_access_fault_EX) & ~interrupt_taken;
+wire ex_hold = ex_exc_pending & mem_transfer_MEM & HREADY & ~bus_error;
+
+// ~ex_exc_pending: EX exception is older and has its own hold.  ~EX_Override_EX: an ID instruction behind a mispredicted
+// branch / jump is on the wrong path and must be flushed, not held.
+wire id_exc_pending_raw = illegal_instr_ID | Ecall_ID | Ebreak_ID | instruction_access_fault_ID;
+wire id_hold = id_exc_pending_raw & ~ex_exc_pending & ~EX_Override_EX & mem_transfer_MEM & HREADY & ~bus_error;
+
+// Ready signal for the FRONT of the pipeline only (pc, IF_ID_reg, ID_EX_reg). The bus-side HREADY is unchanged.
+wire pipe_ready = HREADY & ~ex_hold;
+
+// Final stall: load-use stall (not for an mret in ID, whose rs2 field is not a register) OR id_hold.
+wire Stall = (Stall_raw & ~Mret_taken_ID) | id_hold;
+
+// ---- Exceptions ----
+// Exception raised from EX: the misaligned instruction itself is squashed (like an interrupt).
+// An interrupt in the same cycle wins; the access re-faults after mret.
+// ~mem_transfer_MEM: an older load/store in MEM goes first (see hold above).
+// Bus error beats everything: the instruction in WB is older than the ones in EX / ID.
+wire exception_taken_EX = ex_exc_pending & ~interrupt_taken & ~bus_error & HREADY & ~mem_transfer_MEM;
 
 // Exception raised from ID: the instruction in EX is older and must finish.
 // ~exception_taken_EX: the EX instruction is older than the one in ID, so it traps first.
+// ~EX_Override_EX: wrong path behind a mispredicted branch / jump.
+// ~mem_transfer_MEM: an older load/store in MEM goes first (see hold above).
 // ecall / ebreak are raised from ID exactly like an illegal instruction (same gating), only the cause differs.
 // instruction_access_fault_ID: the fetch address was outside the instruction memory (IF swapped in a nop, so the other flags are all 0).
-wire id_exception_pending = illegal_instr_ID | Ecall_ID | Ebreak_ID | instruction_access_fault_ID;
-wire exception_taken_ID = id_exception_pending & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX;
+wire exception_taken_ID = id_exc_pending_raw & ~interrupt_taken & ~EX_Override_EX & ~exception_taken_EX & ~bus_error & HREADY & ~mem_transfer_MEM;
 
 // Source-agnostic: used by everything that only needs "an exception happened" (PC, IF/ID, ID/EX, CSRs).
-wire exception_taken = exception_taken_ID | exception_taken_EX;
+// bus_error is included: it squashes IF/ID and ID/EX and redirects the PC like any other exception.
+wire exception_taken = exception_taken_ID | exception_taken_EX | bus_error;
 
-// mepc for an exception: the PC of the faulting instruction (EX for misaligned, ID for illegal).
-wire [31:0] exception_mepc = exception_taken_EX ? PC_EX : PC_ID;
+// mepc for an exception: the PC of the faulting instruction.
+// bus error: the load/store is in WB, its PC is PC_Plus_4_WB - 4. EX for misaligned, ID for illegal.
+wire [31:0] exception_mepc = bus_error          ? (PCPlus4_WB - 32'd4) :
+                             exception_taken_EX ? PC_EX :
+                                                  PC_ID;
 
 // Cause code used for BOTH the trap vector (same cycle) and the mcause register.
-// Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0): 2 = illegal instruction.
-// Exception cause: 6 = store address misaligned, 4 = load address misaligned, 2 = illegal instruction.
-// ID-sourced cause: 11 = ecall, 3 = ebreak, otherwise 2 = illegal instruction (the flags are mutually exclusive).
+// Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0).
+// Bus error: 5 = load access fault, 7 = store access fault (decided by the instruction in WB).
+// EX-sourced: 6 = store address misaligned, 4 = load address misaligned, 0 = instruction address misaligned.
+// ID-sourced: 1 = instruction access fault, 11 = ecall, 3 = ebreak, otherwise 2 = illegal instruction.
 // Must match exception_cause_next in mcause.v.
 wire [31:0] id_cause_val = instruction_access_fault_ID ? 32'd1  :
                            Ecall_ID                    ? 32'd11 :
                            Ebreak_ID                   ? 32'd3  :
                                                          32'd2;
-wire [31:0] exception_cause_val = misalign_detect     ? (misalign_is_store ? 32'd6 : 32'd4) :
-                                  ls_access_fault_EX  ? (IsLoad_EX ? 32'd5 : 32'd7) :
+wire [31:0] exception_cause_val = bus_error           ? (IsLoad_WB ? 32'd5 : 32'd7) :
+                                  misalign_detect     ? (misalign_is_store ? 32'd6 : 32'd4) :
                                   fetch_misalign_EX   ? 32'd0 :
                                                         id_cause_val;
 
@@ -197,17 +240,21 @@ wire [31:0] mcause_next = interrupt_taken ? {1'b1, 31'd11}
                                           : exception_cause_val;
 
 // mtval: extra information about the trap, in the same priority order as the cause chain above.
-// bad address for load/store faults, bad jump target for cause 0, bad fetch address for cause 1, the instruction bits for illegal instruction, 0 for ecall/ebreak.
-wire [31:0] mtval_next = (misalign_detect | ls_access_fault_EX) ? Result_EX :
-                         fetch_misalign_EX                      ? (IsJalr_EX ? {Result_EX[31:1], 1'b0} : PCTarget_EX) :
-                         instruction_access_fault_ID            ? PC_ID :
-                         illegal_instr_ID                       ? Instr_ID :
-                                                                  32'd0;
+// bus error: the bad address (ALUResult of the instruction in WB). Misaligned: the bad address. Cause 0: the bad jump target.
+// Cause 1: the bad fetch address. Illegal instruction: the instruction bits. ecall/ebreak: 0.
+wire [31:0] mtval_next = bus_error                          ? ALUResult_WB :
+                         misalign_detect                    ? Result_EX :
+                         fetch_misalign_EX                  ? (IsJalr_EX ? {Result_EX[31:1], 1'b0} : PCTarget_EX) :
+                         instruction_access_fault_ID        ? PC_ID :
+                         illegal_instr_ID                   ? Instr_ID :
+                                                              32'd0;
 wire [31:0] mtval_val;
 
 // A decode-stage mret sitting behind a mispredicted branch is on the wrong path and will be flushed:
 // it must not restore mie / mpie / current_priority.
-wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX & ~exception_taken_EX;
+// ~bus_error: the mret in ID is flushed by the bus-error trap.
+// ~ex_hold: the mret stays in ID for this cycle (PC and IF_ID freeze), so it must not act yet, or it would act twice.
+wire Mret_valid_ID = Mret_taken_ID & ~EX_Override_EX & ~exception_taken_EX & ~bus_error & HREADY & ~ex_hold;
 
 // ============ CSR WIRES ============
 
@@ -221,7 +268,9 @@ wire mepc_sel, mie_sel, mcause_sel, current_priority_sel, previous_priority_sel,
 wire [31:0] mscratch_val, misa_val;
 
 // csrrs/csrrc/csrrsi/csrrci (funct3[1] = 1) with rs1/uimm = 0 only read: they must not write.
-wire csr_write_EX = IsCSR_EX & ~(Instr_EX[13] & (Instr_EX[19:15] == 5'd0));
+// ~bus_error: the CSR instruction in EX is squashed by the bus-error trap, so it must not write.
+// (ex_hold never involves a CSR instruction: EX exceptions only come from loads/stores and branches/jumps.)
+wire csr_write_EX = IsCSR_EX & HREADY & ~bus_error & ~(Instr_EX[13] & (Instr_EX[19:15] == 5'd0));
 
 assign mepc_write_en              = mepc_sel              & csr_write_EX;
 assign mie_write_en               = mie_sel               & csr_write_EX;
@@ -271,6 +320,7 @@ IF_stage IF_stage_inst
     .Mret_taken(Mret_taken_ID),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .pipe_ready(pipe_ready),
     .EX_RedirectPC(EX_RedirectPC_EX),
     .mepc(mepc_for_mret),
     .pc_mtvec_mcause(pc_mtvec_mcause_val),
@@ -290,6 +340,7 @@ IF_ID_reg IF_ID_reg_inst
     .Mret_taken(Mret_taken_ID),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .pipe_ready(pipe_ready),
     .Predicted_Taken_In(Predicted_Taken_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
@@ -306,7 +357,7 @@ IF_ID_reg IF_ID_reg_inst
 ID_stage ID_stage_inst
 (
     .clk(clk),
-    .we(RegWrite_WB),
+    .we(RegWrite_WB & HREADY & ~bus_error),   // ~bus_error: the faulting load must not write rd
     .wa(WA_WB),
     .wd(Result_WB),
     .Instr_In(Instr_ID),
@@ -339,6 +390,10 @@ ID_EX_reg ID_EX_reg_inst
     .Stall(Stall),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
+    .pipe_ready(pipe_ready),
+    .ex_hold(ex_hold),                  // NEW: EX instruction held for one cycle
+    .RD1_Fwd(ForwardedRD1),             // NEW: forwarded operands of the instruction in EX, captured during the hold
+    .RD2_Fwd(ForwardedRD2),             // NEW
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
     .RD1_In(RD1_ID),
@@ -443,14 +498,17 @@ EX_stage EX_stage_inst
     .EX_RedirectPC(EX_RedirectPC_EX)
 );
 
-// EX_MEM_reg flushes on an interrupt or an EX-stage exception (the instruction in EX is squashed), NEVER on an ID-stage exception:
-// for an exception detected in ID, the instruction in EX is older and must finish.
+// EX_MEM_reg flushes (takes a bubble) on: an interrupt, an EX-stage exception (the instruction in EX is squashed),
+// a bus error (the instruction in WB is older, the one in EX is squashed), and ex_hold (the EX instruction must not
+// reach MEM yet, so its access never goes on the bus; it stays in EX and is looked at again next cycle).
+// NEVER on an ID-stage exception or id_hold: the instruction in EX is older than the one in ID and must finish.
 EX_MEM_reg EX_MEM_reg_inst
 (
     .clk(clk),
     .reset(reset),
     .interrupt_taken(interrupt_taken),
-    .exception_taken_EX(exception_taken_EX),
+    .exception_taken_EX(exception_taken_EX | bus_error | ex_hold),
+    .HREADY(HREADY),
     .PC_Plus_4_In(PCPlus4_EX),
     .ALUResult_In(Result_EX),
     .RD2_In(ForwardedRD2),
@@ -460,6 +518,7 @@ EX_MEM_reg EX_MEM_reg_inst
     .Width_In(Width_EX),
     .ResultSrc_In(ResultSrc_EX),
     .RegWrite_In(RegWrite_EX),
+    .IsLoad_In(IsLoad_EX),
     .MemWrite_In(MemWrite_EX),
     .PC_Plus_4_Out(PCPlus4_MEM),
     .ALUResult_Out(ALUResult_MEM),
@@ -470,38 +529,63 @@ EX_MEM_reg EX_MEM_reg_inst
     .Width_Out(Width_MEM),
     .ResultSrc_Out(ResultSrc_MEM),
     .RegWrite_Out(RegWrite_MEM),
+    .IsLoad_Out(IsLoad_MEM),
     .MemWrite_Out(MemWrite_MEM)
 );
 
-MEM_stage #(.DEPTH(DATA_DEPTH)) MEM_stage_inst
+// Address phase of the bus transfer: driven from the MEM-stage registers.
+// The data phase (HWDATA / HRDATA) happens one cycle later, while the instruction is in WB.
+// HRESP / HREADY: in the last cycle of an ERROR response the master drives HTRANS = IDLE (cancels the next transfer).
+AHB_master_CPU_interface AHB_master_CPU_interface_inst
 (
-    .clk(clk),
-    .MemWrite(MemWrite_MEM),
-    .Width(Width_MEM),
-    .Funct3(Funct3_MEM),
-    .RD2(RD2_MEM),
-    .ALUResult(ALUResult_MEM),
-    .ReadData(ReadData_MEM)
+    .IsLoad_MEM(IsLoad_MEM),
+    .MemWrite_MEM(MemWrite_MEM),
+    .HRESP(HRESP),
+    .HREADY(HREADY),
+    .Width_MEM(Width_MEM),
+    .ALUResult_MEM(ALUResult_MEM),
+    .RD2_WB(RD2_WB),
+    .HWRITE(HWRITE),
+    .HTRANS(HTRANS),
+    .HSIZE(HSIZE),
+    .HADDR(HADDR),
+    .HWDATA(HWDATA)
 );
 
 MEM_WB_reg MEM_WB_reg_inst
 (
     .clk(clk),
     .reset(reset),
+    .HREADY(HREADY),
+    .bus_error(bus_error),
     .PC_Plus_4_In(PCPlus4_MEM),
     .ALUResult_In(ALUResult_MEM),
-    .ReadData_In(ReadData_MEM),
     .csr_read_val_In(csr_read_val_MEM),
+    .RD2_In(RD2_MEM),
     .WA_In(WA_MEM),
+    .Funct3_In(Funct3_MEM),
     .ResultSrc_In(ResultSrc_MEM),
     .RegWrite_In(RegWrite_MEM),
+    .IsLoad_In(IsLoad_MEM),
+    .MemWrite_In(MemWrite_MEM),
     .PC_Plus_4_Out(PCPlus4_WB),
     .ALUResult_Out(ALUResult_WB),
-    .ReadData_Out(ReadData_WB),
     .csr_read_val_Out(csr_read_val_WB),
+    .RD2_Out(RD2_WB),
     .WA_Out(WA_WB),
+    .Funct3_Out(Funct3_WB),
     .ResultSrc_Out(ResultSrc_WB),
-    .RegWrite_Out(RegWrite_WB)
+    .RegWrite_Out(RegWrite_WB),
+    .IsLoad_Out(IsLoad_WB),
+    .MemWrite_Out(MemWrite_WB)
+);
+
+// Load data arrives from the bus in WB: sign/zero-extend it here.
+load_extend load_extend_inst
+(
+    .Funct3(Funct3_WB),
+    .HRDATA(HRDATA),
+    .ReadData(ReadData_WB)
 );
 
 result_mux result_mux_inst
@@ -599,8 +683,8 @@ mcause mcause_inst
     .Ebreak(Ebreak_ID),
     .instruction_address_misalign(fetch_misalign_EX),
     .instruction_access_fault(instruction_access_fault_ID),
-    .load_store_access_fault(ls_access_fault_EX),
-    .IsLoad(IsLoad_EX),
+    .bus_error(bus_error),
+    .IsLoad_WB(IsLoad_WB),
     .mcause_write_en(mcause_write_en),
     .csr_wdata(csr_wdata),
     .mcause(mcause_val)

@@ -1,7 +1,7 @@
 module pc(
 	output reg [31:0] PC,
 	input [31:0] PCNext, pc_mtvec_mcause,
-	input clk, reset, Stall, interrupt_taken, exception_taken, HREADY
+	input clk, reset, Stall, interrupt_taken, exception_taken, pipe_ready
 );
 
 always @(posedge clk or posedge reset) begin
@@ -10,7 +10,7 @@ always @(posedge clk or posedge reset) begin
 		PC <= 32'b0;
 	end
 
-	else if(~HREADY)
+	else if(~pipe_ready)
 	begin
 		PC <= PC;
 	end

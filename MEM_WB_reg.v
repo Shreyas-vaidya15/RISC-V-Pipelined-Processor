@@ -1,6 +1,6 @@
 module MEM_WB_reg
 (
-    input clk, reset, HREADY,
+    input clk, reset, HREADY, bus_error,
     input [31:0] PC_Plus_4_In, ALUResult_In, csr_read_val_In, RD2_In,
     input [4:0] WA_In,
     input [2:0] Funct3_In,
@@ -30,6 +30,20 @@ begin
         MemWrite_Out <= 1'b0;
     end
 
+    else if(bus_error & HREADY)
+    begin
+        PC_Plus_4_Out <= 32'b0;
+        ALUResult_Out <= 32'b0;
+        csr_read_val_Out <= 32'b0;
+        WA_Out <= 5'b0;
+        Funct3_Out <= 3'b0;
+        ResultSrc_Out <= 2'b0;
+        RegWrite_Out <= 1'b0;
+        RD2_Out <= 32'b0;
+        IsLoad_Out <= 1'b0;
+        MemWrite_Out <= 1'b0;  
+    end
+
     else if(~HREADY)
     begin
         PC_Plus_4_Out <= PC_Plus_4_Out;
@@ -43,7 +57,7 @@ begin
         IsLoad_Out <= IsLoad_Out;
         MemWrite_Out <= MemWrite_Out; 
     end
-    
+
     else
     begin
         PC_Plus_4_Out <= PC_Plus_4_In;

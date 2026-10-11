@@ -1,6 +1,8 @@
 module ID_EX_reg
 (
-    input clk, reset, Flush, Stall, interrupt_taken, exception_taken, Valid_In, HREADY,
+    input clk, reset, Flush, Stall, interrupt_taken, exception_taken, Valid_In, pipe_ready,
+    input ex_hold,                         // EX instruction is being held for one cycle (older load/store in MEM)
+    input [31:0] RD1_Fwd, RD2_Fwd,         // forwarded operands of the instruction in EX, captured while holding
     input [31:0] PC_In, PC_Plus_4_In, RD1_In, RD2_In, ImmExt_In, Instr_In,
     input [4:0] WA_In,
     input [3:0] ALUControl_In,
@@ -42,12 +44,12 @@ begin
         Valid_Out <= 1'b0;
     end
 
-    else if(~HREADY)
+    else if(~pipe_ready)
     begin
         PC_Out <= PC_Out;
         PC_Plus_4_Out <= PC_Plus_4_Out;
-        RD1_Out <= RD1_Out;
-        RD2_Out <= RD2_Out;
+        RD1_Out <= ex_hold ? RD1_Fwd : RD1_Out;   // hold for an older transfer: keep the forwarded value, the forwarding source disappears next cycle
+        RD2_Out <= ex_hold ? RD2_Fwd : RD2_Out;
         ImmExt_Out <= ImmExt_Out;
         Instr_Out <= Instr_Out;
         WA_Out <= WA_Out;

@@ -1,21 +1,27 @@
 module inst_memory #(parameter DEPTH = 256) (input [31:0] addr, output [31:0] data);
 
 // ============================================================================================
-// INTERRUPT SWEEP IMAGE  (pairs with tb_sweep.v)
+// INTERRUPT SWEEP IMAGE, stage 4: with bus errors  (pairs with tb_sweep in tb.v)
 //
 // One deterministic program, run many times by the testbench. Each run delivers ONE interrupt pulse
 // (keyboard, disk or both) at a different cycle, and the final registers / data memory / CSRs are compared
-// with a run that had no interrupt. The interrupt handler is transparent: it only touches x23.
+// with a run that had no interrupt.
 //
-// The program has no exceptions and never reads a CSR whose value a trap would change (mstatus, mepc, mcause,
-// mtval, priorities). It only uses mscratch, misa and mie, so "interrupted run == reference run" must hold.
+// The program now takes bus errors on purpose (section S8): loads and stores to addresses outside data memory.
+// The exception handler is transparent: it counts the exception in x24, skips the faulting instruction
+// (mepc += 4) and uses x26 as scratch (cleared again before mret).
+// The interrupt handler is transparent too: it only touches x23.
+// Every run must take the same number of exceptions as the reference run (exp_exc = 14: 11 bus errors + 3 EX exceptions in S9).
+//
+// The program never reads a CSR whose value a trap would change (mstatus, mcause, mtval, priorities).
+// It uses mscratch, misa, mie, and mstatus only in windows where MIE = 0.
 //
 // Fixed layout:  0 jal x0,MAIN | 100 jal x0,EXC_H | 144 jal x0,IRQ_H (mtvec reset 0x65, cause 11 -> base+44)
-//                160 IRQ_H: x23++ ; mret        192 EXC_H: x24++ ; mepc += 4 ; mret (never expected to run)
+//                160 IRQ_H: x23++ ; mret        192 EXC_H: x24++ ; mepc += 4 ; mret   (runs once per bus error)
 //                512.. main program
 //
-// Reserved registers: x23 interrupt counter, x24 exception counter, x30 end marker (99), x26 stays 0
-// (it is only written by instructions that must be skipped).
+// Reserved registers: x23 interrupt counter, x24 exception counter, x30 end marker (99),
+//                     x26 stays 0 (written only by skipped instructions and by the exception handler, which clears it)
 //
 // What the program covers (an interrupt can land on any of these):
 //   S1  back-to-back ALU forwarding, shifts, slt/sltu, lui
@@ -25,6 +31,12 @@ module inst_memory #(parameter DEPTH = 256) (input [31:0] addr, output [31:0] da
 //   S4  jal / jalr, call and return, jalr to a computed address
 //   S5  mscratch csrrw/csrrs/csrrc/csrrsi with the result used at once, misa read
 //   S6  mstatus.MIE = 0 window, then "csrrw mepc ; mret" back to back (a software mret jump)
+//   S7  CSR / load-pointer / mret cases right behind a memory op (wait states)
+//   S8  bus errors: bad load, bad store, good access right behind a bad one, back-to-back bad accesses,
+//       a bad access inside a loop, a bad load right before a mispredicted branch and before a jal
+//   S9  operand capture during the older-transfer hold: an EX exception (misaligned load / store / branch target) sits
+//       right behind a load/store, and the operand it needs came from a producer one place before that load/store.
+//       While the exception waits one cycle in EX the producer leaves the pipeline, so the operand must have been captured.
 // ============================================================================================
 
 reg [7:0] mem [0:DEPTH*4-1];
@@ -37,6 +49,9 @@ localparam [11:0] CSR_MSTATUS = 12'h300, CSR_MISA = 12'h301, CSR_MIE = 12'h304,
 
 integer pc, pass, i, k;
 integer n_greg, n_gmem, prog_end;
+integer exp_exc;                       // number of exceptions the program takes in total (read by the testbench)
+integer exp_bus_err;                   // how many of them are bus errors (= ERROR responses from the slave)
+integer exp_hold;                      // how many older-transfer holds (ex_hold) the program must cause at least
 
 // ---- golden tables read by the testbench (checked on the reference run) ----
 integer        gold_reg   [0:63];
@@ -46,7 +61,7 @@ integer        gold_addr  [0:63];
 reg [31:0]     gold_mval  [0:63];
 
 integer L_main, L_irq, L_exc;
-integer L_l1, L_l2, L_l3, L_b1, L_b2, L_b3, L_b4, L_b5, L_b6, L_fn, L_after, L_mret_t, L_mret_t2;
+integer L_l1, L_l2, L_l3, L_l4, L_b1, L_b2, L_b3, L_b4, L_b5, L_b6, L_b8, L_j8, L_fn, L_after, L_mret_t, L_mret_t2;
 
 // ---- instruction encoders (arguments in assembly order) ----
 function [31:0] CSRRW;  input [4:0] rd; input [11:0] csr; input [4:0] rs1; CSRRW  = {csr, rs1, 3'b001, rd, 7'b1110011}; endfunction
@@ -125,6 +140,9 @@ endtask
 task build;
 begin
     n_greg = 0; n_gmem = 0;
+    exp_bus_err = 11;                 // S8: 1 + 1 + 3 + 4 + 2 bus errors
+    exp_exc = 14;                     // + S9: misaligned load, misaligned store, taken branch with a misaligned target
+    exp_hold = 3;                     // S9: one ex_hold per case
     L_main = 512; L_irq = 160; L_exc = 192;
 
     // ---- boot and vectors ----
@@ -137,13 +155,16 @@ begin
     emit(ADDI(23, 23, 1));
     emit(MRET);
 
-    // ---- exception handler: should never run (x24 is checked) ----
+    // ---- exception handler: transparent for bus errors. x24 counts them, the faulting load/store is skipped. ----
+    // x26 is the scratch register; it is cleared again so the "skipped instructions never ran" check still works.
+    // MIE = 0 in here, so no interrupt can overwrite mepc between the csrrs and the csrrw.
     pc = 192;
     emit(ADDI(24, 24, 1));
-    emit(CSRRS(28, CSR_MEPC, 0));
-    emit(ADDI(28, 28, 4));
-    emit(CSRRW(0, CSR_MEPC, 28));
-    emit(NOP); emit(NOP);
+    emit(CSRRS(26, CSR_MEPC, 0));        // x26 = PC of the faulting load/store
+    emit(ADDI(26, 26, 4));
+    emit(CSRRW(0, CSR_MEPC, 26));        // mepc = the next instruction
+    emit(ADDI(26, 0, 0));                // x26 = 0 again
+    emit(NOP);
     emit(MRET);
 
     // ================= main program =================
@@ -354,12 +375,127 @@ begin
     emit(CSRRSI(0, CSR_MSTATUS, 5'd8));     // MIE = 1 again (MPIE is already 1)
     gm(176, 32'h5A5); gm(180, 32'h1880);
 
+    // ---------- S8: bus errors ----------
+    // Data memory is 256 bytes, so x1 = 256 is the first bad address. A bad load leaves rd unchanged (the handler skips it),
+    // a bad store writes nothing. Every case is stored at once and checked by a golden value.
+    // Free registers here: x1 x2 x4 x6 x8 x9 x12 x20 x27 x28 x29 x31. Data memory words 0..40 are free.
+    emit(SW(26, 0, 0));                     // x26 must still be 0: mem[0] = 0 (no exception has run yet)
+    gm(0, 32'd0);
+    emit(ADDI(1, 0, 12'd256));              // x1 = 256, the bad base address
+    emit(ADDI(2, 0, 12'h066));
+    emit(SW(2, 8, 0));                      // mem[8] = 0x66 (good store)
+    gm(8, 32'h66);
+
+    // a: bad load, then a good load right behind it, then stores that use both results (1 bus error)
+    emit(ADDI(4, 0, 12'h077));
+    emit(LW(4, 0, 1));                      // BAD load: x4 keeps 0x77
+    emit(LW(8, 8, 0));                      // good load right behind: x8 = 0x66 (squashed once, then re-run)
+    emit(SW(4, 4, 0));                      // mem[4] = 0x77
+    emit(SW(8, 12, 0));                     // mem[12] = 0x66 (load-use on x8)
+    gm(4, 32'h77); gm(12, 32'h66);
+
+    // b: bad store, then a good store right behind it (1 bus error)
+    emit(ADDI(6, 0, 12'h055));
+    emit(SW(6, 0, 1));                      // BAD store to 256: nothing written
+    emit(SW(6, 16, 0));                     // good store right behind: mem[16] = 0x55
+    gm(16, 32'h55);
+
+    // c: bad load, bad load, bad store back to back (3 bus errors)
+    emit(ADDI(9, 0, 12'h099));
+    emit(ADDI(12, 0, 12'h01C));
+    emit(LW(9, 0, 1));                      // BAD: x9 keeps 0x99
+    emit(LW(12, 4, 1));                     // BAD (260): x12 keeps 0x1C
+    emit(SW(6, 8, 1));                      // BAD store (264)
+    emit(SW(9, 20, 0));                     // mem[20] = 0x99
+    emit(SW(12, 24, 0));                    // mem[24] = 0x1C
+    gm(20, 32'h99); gm(24, 32'h1C);
+
+    // d: a bad load inside a loop, 4 passes (4 bus errors). x31 keeps 0x31, the loop sum is 12.
+    emit(ADDI(31, 0, 12'h031));
+    emit(ADDI(28, 0, 0));
+    emit(ADDI(29, 0, 4));
+    L_l4 = pc;
+    emit(LW(31, 0, 1));                     // BAD load every pass
+    emit(ADDI(28, 28, 3));
+    emit(ADDI(29, 29, -1));
+    emit(BRL(3'b001, 29, 0, L_l4));         // bne, backward: predicted taken, exit is a mispredict
+    emit(SW(28, 28, 0));                    // mem[28] = 12
+    emit(SW(31, 32, 0));                    // mem[32] = 0x31
+    gm(28, 32'd12); gm(32, 32'h31);
+
+    // e: bad load right before a mispredicted branch, and right before a jal (2 bus errors)
+    emit(ADDI(4, 0, 5));
+    emit(LW(6, 0, 1));                      // BAD load, x6 keeps 0x55
+    emit(BRL(3'b000, 0, 0, L_b8));          // beq x0,x0: taken, forward = predicted not taken: mispredict resolves while the bad load is in WB
+    emit(ADDI(4, 4, 100));                  // skipped
+    L_b8 = pc;
+    emit(ADDI(4, 4, 1));                    // x4 = 6
+    emit(LW(6, 4, 1));                      // BAD load (260)
+    emit(JAL(20, L_j8));                    // jal right behind it, link in x20
+    emit(ADDI(4, 4, 200));                  // skipped
+    L_j8 = pc;
+    emit(ADDI(4, 4, 2));                    // x4 = 8
+    emit(SW(4, 36, 0));                     // mem[36] = 8
+    emit(SW(6, 40, 0));                     // mem[40] = 0x55
+    gm(36, 32'd8); gm(40, 32'h55);
+
+    // ---------- S9: operand capture during the older-transfer hold ----------
+    // Layout of every case:  P (producer of the operand), A (good load/store), B (EX exception).
+    // When B is in EX, A is in MEM, so B waits one cycle (ex_hold) and P has left the pipeline by then: the forwarded operand
+    // must have been captured in ID_EX_reg. In every case the STALE operand (the register-file value B read in ID) would
+    // give a different result: no exception, a load that runs, or a store that writes. x24 and the memory words tell.
+    // Free registers here: x1 x2 x16 x27. Data memory words 96..116 are free.
+
+    // C1: misaligned LOAD, base comes from a LOAD (P), A is a store. Right base 33 (misaligned), stale base 40 (valid, mem[40] = 0x55).
+    emit(ADDI(1, 0, 12'd33));
+    emit(SW(1, 96, 0));                     // mem[96] = 33
+    emit(ADDI(27, 0, 12'd40));              // stale base
+    emit(ADDI(2, 0, 12'h0AA));              // x2 = 0xAA: must survive (the load is skipped)
+    emit(LW(27, 96, 0));                    // P: x27 = 33
+    emit(SW(2, 100, 0));                    // A: mem[100] = 0xAA
+    emit(LW(2, 0, 27));                     // B: address 33, misaligned, cause 4. Stale base would load 0x55 into x2.
+    emit(NOP);
+    emit(SW(2, 104, 0));                    // mem[104] = 0xAA
+    gm(96, 32'd33); gm(100, 32'hAA); gm(104, 32'hAA);
+
+    // C2: misaligned STORE, base comes from an ALU op (P), A is a load. Right base 109 (misaligned), stale base 108 (valid).
+    emit(ADDI(27, 0, 12'd108));             // stale base
+    emit(ADDI(2, 0, 12'h0BB));              // x2 = 0xBB: the data
+    emit(ADDI(27, 0, 12'd109));             // P
+    emit(LW(16, 100, 0));                   // A: x16 = 0xAA
+    emit(SW(2, 0, 27));                     // B: address 109, misaligned, cause 6. Stale base would write 0xBB to mem[108].
+    emit(SW(16, 112, 0));                   // mem[112] = 0xAA
+    gm(108, 32'd0); gm(112, 32'hAA);
+
+    // C3: taken branch with a misaligned target (cause 0). The branch needs rs2 (x1) from the producer P: right x1 = 5 (equal, taken),
+    // stale x1 = 7 (not equal, not taken, no exception). A is a store.
+    emit(ADDI(27, 0, 12'd5));
+    emit(ADDI(1, 0, 12'd7));                // stale rs2
+    emit(ADDI(1, 0, 12'd5));                // P
+    emit(SW(2, 116, 0));                    // A: mem[116] = 0xBB
+    emit(BRL(3'b000, 27, 1, pc + 10));      // B: beq x27,x1: taken, target = pc + 10 has bit 1 set
+    emit(NOP);
+    gm(116, 32'hBB);
+
     // ---------- end ----------
     emit(ADDI(30, 0, 99));
     prog_end = pc;
     emit(JALO(0, 0));                 // park
 
-    gr(24, 32'd0, "no exception ran");
+    gr(4, 32'd8, "x4 branch+jal path");
+    gr(6, 32'h55, "x6 kept by bad loads");
+    gr(8, 32'h66, "x8 good load");
+    gr(9, 32'h99, "x9 kept by bad load");
+    gr(12, 32'h1C, "x12 kept by bad load");
+    gr(20, L_j8 - 4, "x20 jal link");
+    gr(28, 32'd12, "x28 loop sum");
+    gr(29, 32'd0, "x29 loop count");
+    gr(31, 32'h31, "x31 kept by bad load");
+    gr(1, 32'd5, "x1 branch operand");
+    gr(2, 32'hBB, "x2 data");
+    gr(16, 32'hAA, "x16 load behind");
+    gr(27, 32'd5, "x27 branch operand");
+    gr(24, exp_exc, "x24 exceptions taken");
     gr(26, 32'd0, "skipped instrs not run");
     gr(30, 32'd99, "end marker");
 

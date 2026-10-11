@@ -1,6 +1,6 @@
 module IF_ID_reg
 (
-    input clk, reset, Flush, Stall, Predicted_Taken_In, Mret_taken, interrupt_taken, exception_taken, instruction_access_fault_In, HREADY,
+    input clk, reset, Flush, Stall, Predicted_Taken_In, Mret_taken, interrupt_taken, exception_taken, instruction_access_fault_In, pipe_ready,
     input [31:0] Instr_In, PC_In, PC_Plus_4_In,
     output reg [31:0] Instr_Out, PC_Out, PC_Plus_4_Out,
     output reg Predicted_Taken_Out, instruction_access_fault_Out, Valid_Out
@@ -19,7 +19,7 @@ instruction_access_fault_Out <= 1'b0;
 Valid_Out <= 1'b0;
 end
 
-else if(~HREADY)
+else if(~pipe_ready)
 begin
 Instr_Out <= Instr_Out;
 PC_Out <= PC_Out;

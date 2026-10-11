@@ -1,6 +1,6 @@
 module IF_stage #(parameter DEPTH = 256)
 (
-input clk, reset, Stall, EX_Override, Mret_taken, interrupt_taken, exception_taken, HREADY,
+input clk, reset, Stall, EX_Override, Mret_taken, interrupt_taken, exception_taken, pipe_ready,
 input [31:0] EX_RedirectPC, mepc, pc_mtvec_mcause,
 output [31:0] PC, PCPlus4, Instr,
 output Predicted_Taken,
@@ -60,7 +60,7 @@ pc pc_inst(
     .Stall(Stall),
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
-    .HREADY(HREADY)
+    .pipe_ready(pipe_ready)
 );
 
 inst_memory #(.DEPTH(DEPTH)) instruction_memory_inst(

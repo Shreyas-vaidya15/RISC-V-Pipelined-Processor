@@ -2,6 +2,8 @@ module AHB_master_CPU_interface
 (
     input IsLoad_MEM,
     input MemWrite_MEM,
+    input HRESP,
+    input HREADY,
     input [1:0] Width_MEM,
     input [31:0] ALUResult_MEM,
     input [31:0] RD2_WB,
@@ -13,7 +15,7 @@ module AHB_master_CPU_interface
 );
 
 assign HWRITE = MemWrite_MEM;
-assign HTRANS = (IsLoad_MEM | MemWrite_MEM) ? 2'b10 : 2'b00;
+assign HTRANS = (HRESP & HREADY) ? 2'b00 : (IsLoad_MEM | MemWrite_MEM) ? 2'b10 : 2'b00;
 assign HSIZE = {1'b0, Width_MEM};
 assign HADDR = ALUResult_MEM;
 assign HWDATA = RD2_WB;

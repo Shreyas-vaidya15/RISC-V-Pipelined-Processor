@@ -12,7 +12,7 @@ module AHB_data_memory #(parameter DEPTH = 64)   // DEPTH is in WORDS; passed do
     input [3:0] WAIT_CYCLES,
     output HREADYOUT,
     output HRESP,
-    output [31:0] HRDATA
+    output reg [31:0] HRDATA
 );
 
 // ---------------- states ----------------
@@ -142,7 +142,23 @@ data_memory #(.DEPTH(DEPTH)) data_memory_inst
     .rdata(rdata_mem)
 );
 
-// real data only in OKAY; junk constant while waiting and in both error cycles
-assign HRDATA = (state == S_OKAY) ? rdata_mem : 32'hBAD0BAD0;
+always@(*)
+begin
 
+    if(state == S_OKAY)
+    begin
+        HRDATA = rdata_mem;
+    end
+
+    else if(state == S_WAIT)
+    begin
+        HRDATA = 32'hBAD0BAD0;
+    end
+
+    else
+    begin
+        HRDATA = 32'h0;
+    end
+
+end
 endmodule

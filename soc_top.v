@@ -22,6 +22,7 @@ top cpu_inst
     .interrupt_keyboard(interrupt_keyboard),
     .interrupt_disk(interrupt_disk),
     .HREADY(HREADY),
+    .HRESP(HRESP),
     .HRDATA(HRDATA),
     .HWRITE(HWRITE),
     .HTRANS(HTRANS),

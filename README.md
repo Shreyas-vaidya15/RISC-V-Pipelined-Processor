@@ -38,6 +38,7 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 ├── alu.v
 ├── alu_decoder.v
 ├── alu_mux.v
+├── branch_comparator.v           # branch decision: equal / signed less-than / unsigned less-than on the two register values
 ├── csr_addr_decoder.v            # CSR address -> "which CSR is addressed" select signals
 ├── csr_read_data.v               # selects the old CSR value returned to rd
 ├── csr_write_data.v              # selects the new CSR value to write, per funct3
@@ -62,7 +63,7 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 ├── mscratch.v                    # scratch register for software
 ├── misa.v                        # hardwired RV32I
 ├── pc.v
-├── pc_mtvec_mcause.v             # trap target from mtvec mode, base and cause
+├── pc_mtvec_mcause.v             # trap target from mtvec mode, base and interrupt_ID
 ├── pc_mux.v
 ├── pc_plus_4.v
 ├── pc_target.v
@@ -375,6 +376,24 @@ So with the same exceptions taken, everything except `x23` must be identical to 
 - **Coverage check**: for every instruction address where the interrupt gate was open at least once in the reference run, the sweep must have landed an interrupt there. A miss is a "hole" and fails the test. Addresses that are never open are blocked by design: before `MIE` is on, inside `MIE = 0` windows, right behind a load/store, and on `mret`.
 
 **Result (from the run that was checked):** 8763 runs across the four modes, **0 failures, 0 coverage holes**, `=== ALL CHECKS PASSED ===` in all four modes. In the reference run, 137 of 197 executed instruction addresses were open to an interrupt (an interrupt landed on all of them); the other 60 are blocked by design as listed above.
+
+### Official riscv-tests (rv32ui)
+
+The core also runs the `rv32ui` suite from the official `riscv-tests` repository, built with a custom minimal `riscv_test.h` (not the stock environment, which needs privileged setup this SoC does not use). `tb_rv.v` (module `tb_rv`) runs one test per simulation.
+
+**Result: 40 of 40 tests pass at 0, 1 and 2 wait states per transfer.**
+
+- **Pass / fail protocol.** `TESTNUM` lives in `x3`. A pass sets `x10 = 0`; a fail sets `x10 = (test number << 1) | 1`. Both set `x30 = 99` and loop. The testbench prints PASS only if `x10 = 0` and no exception was taken. A FAIL line reports `x10`, the failing check number, `x3`, the exception count, `mepc` and `mcause`.
+- **Memory layout.** `.text` is linked at address 0 and loaded through `+hex=` into the instruction memory (testbench overrides its depth to 1024 words, no RTL change). `.data` is linked at address 0 too and loaded straight into the slave's byte array through `+data=`. The largest `.data` is 80 bytes, which fits the 256-byte data memory.
+- **Harness check.** Running `lw` with a zeroed data image reports FAIL at check 2, so a failing test is visible.
+- **Run:** `vvp sim_rv +hex=<test>.text.hex +data=<test>.data.hex [+wait=N]`
+- **Reproduce everything:** `./rv_tests/run_rvtests.sh` builds the simulator, assembles all 40 tests and runs them at 0, 1 and 2 waits (needs `iverilog`, `riscv64-unknown-elf-gcc` and a clone of `riscv-tests` at `~/riscv-tests`). Run it from WSL or Linux.
+
+Scope:
+
+- `rv32ui` only. `fence_i` and `ma_data` are skipped (the core traps on misaligned accesses instead of handling them).
+- No interrupts are injected in these runs; interrupt interaction is covered by `tb_sweep`.
+- Wait modes 0, 1 and 2 only. The random-wait mode is covered by `tb_sweep`.
 
 ### Known limitations
 

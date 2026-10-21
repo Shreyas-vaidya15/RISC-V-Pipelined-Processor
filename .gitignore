@@ -12,3 +12,5 @@ waves.*
 # Temporary files
 *.tmp
 *.wcfg
+c_build/
+c_run/

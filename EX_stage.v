@@ -13,7 +13,8 @@ wire [31:0] B;
 
 reg [31:0] A;
 wire IsAuipc = (Instr[6:0] == 7'b0010111);
-wire BranchDecision = Instr[14] ? Result[0] : Zero;
+
+wire BranchDecision;
 assign Actual_Taken = BranchDecision ^ Instr[12];
 assign Mispredict = (Branch & (Actual_Taken ^ Predicted_Taken));
 assign EX_Override = Jump | Mispredict;
@@ -61,6 +62,14 @@ else
 
     EX_RedirectPC = PC_Plus_4;
 end
+
+branch_comparator branch_comparator_inst
+(
+    .A(RD1),
+    .B(RD2),
+    .funct3(Instr[14:12]),
+    .condition(BranchDecision)
+);
 
 alu_mux alu_mux_inst
 (

@@ -220,26 +220,15 @@ wire [31:0] exception_mepc = bus_error          ? (PCPlus4_WB - 32'd4) :
                              exception_taken_EX ? PC_EX :
                                                   PC_ID;
 
-// Cause code used for BOTH the trap vector (same cycle) and the mcause register.
-// Interrupt taken -> interrupt cause (bit 31 = 1). Otherwise -> exception cause (bit 31 = 0).
-// Bus error: 5 = load access fault, 7 = store access fault (decided by the instruction in WB).
-// EX-sourced: 6 = store address misaligned, 4 = load address misaligned, 0 = instruction address misaligned.
-// ID-sourced: 1 = instruction access fault, 11 = ecall, 3 = ebreak, otherwise 2 = illegal instruction.
-// Must match exception_cause_next in mcause.v.
-wire [31:0] id_cause_val = instruction_access_fault_ID ? 32'd1  :
-                           Ecall_ID                    ? 32'd11 :
-                           Ebreak_ID                   ? 32'd3  :
-                                                         32'd2;
-wire [31:0] exception_cause_val = bus_error           ? (IsLoad_WB ? 32'd5 : 32'd7) :
-                                  misalign_detect     ? (misalign_is_store ? 32'd6 : 32'd4) :
-                                  fetch_misalign_EX   ? 32'd0 :
-                                                        id_cause_val;
+// The cause CODE is computed only inside mcause.v (the mcause register). The trap VECTOR does not need it:
+// an exception always goes to the mtvec base, and an interrupt's vector comes from interrupt_ID alone
+// (see pc_mtvec_mcause). So no exception-cause chain (which depends on the ALU result) feeds the PC any more.
+// Cause codes (for reference, all produced in mcause.v):
+// interrupt: bit 31 = 1, cause 11 (keyboard and disk; the timer will be 7).
+// bus error: 5 = load access fault, 7 = store access fault. EX: 6 = store misaligned, 4 = load misaligned, 0 = instruction address misaligned.
+// ID: 1 = instruction access fault, 11 = ecall, 3 = ebreak, otherwise 2 = illegal instruction.
 
-// Keyboard and disk are both machine external interrupts: cause 11 (interrupt bit set). The timer will be cause 7.
-wire [31:0] mcause_next = interrupt_taken ? {1'b1, 31'd11}
-                                          : exception_cause_val;
-
-// mtval: extra information about the trap, in the same priority order as the cause chain above.
+// mtval: extra information about the trap, in the same priority order as the cause chain in mcause.v.
 // bus error: the bad address (ALUResult of the instruction in WB). Misaligned: the bad address. Cause 0: the bad jump target.
 // Cause 1: the bad fetch address. Illegal instruction: the instruction bits. ecall/ebreak: 0.
 wire [31:0] mtval_next = bus_error                          ? ALUResult_WB :
@@ -391,9 +380,9 @@ ID_EX_reg ID_EX_reg_inst
     .interrupt_taken(interrupt_taken),
     .exception_taken(exception_taken),
     .pipe_ready(pipe_ready),
-    .ex_hold(ex_hold),                  // NEW: EX instruction held for one cycle
-    .RD1_Fwd(ForwardedRD1),             // NEW: forwarded operands of the instruction in EX, captured during the hold
-    .RD2_Fwd(ForwardedRD2),             // NEW
+    .ex_hold(ex_hold),                  // EX instruction held for one cycle
+    .RD1_Fwd(ForwardedRD1),             // forwarded operands of the instruction in EX, captured during the hold
+    .RD2_Fwd(ForwardedRD2),
     .PC_In(PC_ID),
     .PC_Plus_4_In(PCPlus4_ID),
     .RD1_In(RD1_ID),
@@ -711,10 +700,13 @@ mtvec mtvec_inst
     .mtvec_out(mtvec_val)
 );
 
+// Trap target. Exception -> mtvec base. Interrupt -> base (direct) or base + offset chosen by interrupt_ID (vectored).
+// No exception-cause signal reaches this module any more.
 pc_mtvec_mcause pc_mtvec_mcause_inst
 (
     .mtvec_out(mtvec_for_trap),                         // bypassed: an mtvec write in EX is visible to a trap raised from ID
-    .mcause(mcause_next),
+    .interrupt_taken(interrupt_taken),
+    .interrupt_ID(interrupt_ID),
     .pc_mtvec_mcause(pc_mtvec_mcause_val)
 );
 

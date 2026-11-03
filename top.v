@@ -428,6 +428,8 @@ ID_EX_reg ID_EX_reg_inst
 stall_unit stall_unit_inst
 (
     .ID_EX_opcode(Instr_EX[6:0]),
+    .IF_ID_opcode(Instr_ID[6:0]),
+    .IF_ID_funct3(Instr_ID[14:12]),
     .IF_ID_rs1(Instr_ID[19:15]),
     .IF_ID_rs2(Instr_ID[24:20]),
     .ID_EX_WA(WA_EX),

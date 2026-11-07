@@ -1,8 +1,8 @@
 # RV32I RISC-V Processor with Nested Interrupts, Exceptions and an AHB-Lite Data Bus (5-Stage Pipeline)
 
-A **32-bit RV32I RISC-V Processor** implemented in **Verilog HDL** and built up in stages: a single-cycle design, converted into a **5-stage pipelined implementation** (IF → ID → EX → MEM → WB), then given hazard control (full data forwarding and load-use stall handling), then **BTFNT static branch prediction** (backward-taken, forward-not-taken: a branch that jumps backward, like a loop, is guessed taken; one that jumps forward is guessed not taken), then extended with **machine-mode trap handling for two external interrupt sources (keyboard, disk) with hardware priority tracking and software-managed nesting**, then with **synchronous exceptions** (illegal instruction, misaligned memory accesses, `ecall`, `ebreak`, instruction faults), and finally with an **AHB-Lite data bus**: the data memory now sits outside the CPU as an AHB slave that can insert **wait states** and answer with an **ERROR response**, which the CPU turns into a load/store access-fault exception.
+A **32-bit RV32I RISC-V Processor** implemented in **Verilog HDL** and built up in stages: a single-cycle design, converted into a **5-stage pipelined implementation** (IF → ID → EX → MEM → WB), then given hazard control (full data forwarding and load-use stall handling), then **BTFNT static branch prediction** (backward-taken, forward-not-taken: a branch that jumps backward, like a loop, is guessed taken; one that jumps forward is guessed not taken; `jal` is always redirected in IF), then extended with **machine-mode trap handling for two external interrupt sources (keyboard, disk) with hardware priority tracking and software-managed nesting**, then with **synchronous exceptions** (illegal instruction, misaligned memory accesses, `ecall`, `ebreak`, instruction faults), then with an **AHB-Lite data bus**: the data memory now sits outside the CPU as an AHB slave that can insert **wait states** and answer with an **ERROR response**, which the CPU turns into a load/store access-fault exception, and finally with the **identification CSRs** and the 64-bit **`mcycle` / `minstret` counters**.
 
-The control and status registers (CSRs) follow the **official RISC-V privileged spec**: standard CSR addresses, `mstatus` bit layout, `mie`, `mip`, `mtvec` (with direct/vectored mode), `mtval`, `mscratch` and `misa`. The only non-standard CSRs are the two priority registers, placed in the spec's custom machine-mode address range.
+The control and status registers (CSRs) follow the **official RISC-V privileged spec**: standard CSR addresses, `mstatus` bit layout, `mie`, `mip`, `mtvec` (with direct/vectored mode), `mtval`, `mscratch`, `misa`, the identification CSRs (`mvendorid`, `marchid`, `mimpid`, `mhartid`) and the cycle / instructions-retired counters (`mcycle`, `minstret` and their read-only `cycle` / `instret` copies). The only non-standard CSRs are the two priority registers, placed in the spec's custom machine-mode address range.
 
 ---
 
@@ -12,9 +12,10 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 - **5-stage pipelined datapath**: IF, ID, EX, MEM, WB
 - Dedicated pipeline registers: `IF_ID_reg`, `ID_EX_reg`, `EX_MEM_reg`, `MEM_WB_reg`
 - **Full data forwarding**: `forwarding_unit` + `forward_mux` resolve RAW hazards from EX/MEM and MEM/WB (ALU operands, store data/address, `jalr` base, CSR reads)
-- **Load-use stall detection**: `stall_unit` inserts a one-cycle bubble when a load's result is needed by the next instruction
-- **BTFNT static branch prediction**: predicted in IF from the sign of the branch offset, resolved in EX; mispredicts and jumps flush `IF_ID_reg` and `ID_EX_reg`
-- **Real `nop` bubbles**: a flushed or stalled slot holds `addi x0, x0, 0` (`0x00000013`) as the spec requires, and a `Valid` bit travels with each instruction so the core can tell a bubble from a real `nop`
+- **Load-use stall detection**: `stall_unit` inserts a one-cycle bubble only when the instruction in ID really reads the register the load writes: rs1 for `jalr`, loads, ALU-immediate and the register forms of CSR instructions; rs1 and rs2 for branches, stores and ALU-register instructions. Instructions that read no register (`lui`, `auipc`, `jal`, the CSR-immediate forms, `ecall`, `ebreak`, `mret`) never stall, so immediate or shift-amount bits that look like the loaded register number no longer cause a false stall
+- **BTFNT static branch prediction**: predicted in IF from the sign of the branch offset, resolved in EX; a mispredicted branch flushes `IF_ID_reg` and `ID_EX_reg`
+- **`jal` redirected in IF**: `jal` always jumps, so IF takes its target (J-type immediate) straight away and nothing is flushed. Only `jalr`, whose target needs a register value, still redirects from EX and flushes
+- **Real `nop` bubbles**: a flushed or stalled slot holds `addi x0, x0, 0` (`0x00000013`) as the spec requires, and a `Valid` bit travels with each instruction through every stage up to WB, so the core can tell a bubble from a real `nop`
 - **AHB-Lite data bus** (CPU = master, data memory = slave) with **wait states** (`HREADY` freezes the pipeline) and a **two-cycle ERROR response** (`HRESP`)
 - **Two external interrupt sources (keyboard, disk)**, each with its own pending latch (`interrupt_latch`); both are reported as machine external interrupts (cause 11)
 - **Priority-based arbitration**: `interrupt_priority_encoder` reports the highest pending source (disk = 2, keyboard = 1, none = 0). A trap is taken only if that level is **strictly greater than** the level currently running (`current_priority`)
@@ -22,7 +23,9 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 - **Software-managed nesting**: a handler saves `mepc`, `mcause`, `previous_priority` and any live registers on a stack in data memory *before* re-enabling `mstatus.MIE`
 - **Exceptions** raised from ID, EX and WB, each with its spec cause code and an `mtval` value (see [Exceptions](#exceptions))
 - **Older-transfer hold**: an exception never overtakes an older load/store that is still on the bus (see [Older-transfer hold](#older-transfer-hold))
-- **Official CSR set**: `mstatus`, `misa`, `mie`, `mtvec`, `mscratch`, `mepc`, `mcause`, `mtval`, `mip`, plus custom `current_priority` / `previous_priority`
+- **CSR set**: `mstatus`, `misa`, `mie`, `mtvec`, `mscratch`, `mepc`, `mcause`, `mtval`, `mip`, the identification CSRs (`mvendorid`, `marchid`, `mimpid`, `mhartid`, all reading 0), plus custom `current_priority` / `previous_priority`
+- **Cycle and instruction counters**: 64-bit `mcycle` and `minstret` (low and high halves) with read-only `cycle` / `instret` copies. `mcycle` counts every clock, including stall and wait-state cycles. `minstret` counts only instructions that retire: bubbles and trapped or squashed instructions are never counted
+- **Read-only CSRs**: a write to a CSR whose address bits [11:10] are `11` raises an illegal-instruction exception
 - **Writable `mtvec`** with direct and vectored modes
 - `csrrs`/`csrrc`/`csrrsi`/`csrrci` with `rs1`/`uimm` = 0 only read, as the spec requires
 - CSR write bypasses so an `mret` or a trap in ID sees a CSR write that is still in EX
@@ -42,6 +45,7 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 ├── csr_addr_decoder.v            # CSR address -> "which CSR is addressed" select signals
 ├── csr_read_data.v               # selects the old CSR value returned to rd
 ├── csr_write_data.v              # selects the new CSR value to write, per funct3
+├── csr_counters.v                # mcycle / minstret 64-bit counters (cycle / instret read the same registers)
 ├── current_priority.v            # priority level of the code currently running (0 = main program)
 ├── previous_priority.v           # level that was interrupted; restored into current_priority by mret
 ├── interrupt_priority_encoder.v  # pending keyboard/disk -> interrupt_ID (2 = disk, 1 = keyboard, 0 = none)
@@ -49,7 +53,7 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 ├── instruction_memory.v          # program image (built by an initial block, see Verification)
 ├── main_decoder.v
 ├── illegal_function.v            # illegal funct3 / funct7 detection
-├── illegal_csr_addr.v            # CSR address that is not implemented
+├── illegal_csr_addr.v            # CSR address not implemented, or a write to a read-only CSR
 ├── misaligned_detect.v           # misaligned load/store (EX)
 ├── instruction_address_misalign.v# taken branch/jump to a target with bit 1 set (EX)
 ├── instruction_access_fault.v    # fetch address outside instruction memory (IF)
@@ -77,7 +81,7 @@ The control and status registers (CSRs) follow the **official RISC-V privileged 
 ├── MEM_WB_reg.v
 ├── forwarding_unit.v             # RAW hazard detection (EX/MEM, MEM/WB)
 ├── forward_mux.v                 # 3-input operand select
-├── stall_unit.v                  # load-use hazard detection
+├── stall_unit.v                  # load-use hazard detection (only for instructions that read the loaded register)
 ├── AHB_master_CPU_interface.v    # EX/MEM register outputs -> AHB-Lite master signals
 ├── data_memory.v                 # byte-organised memory array (little-endian)
 ├── AHB_data_memory.v             # AHB-Lite slave: wait states, ERROR response, wraps data_memory
@@ -97,17 +101,17 @@ There is no separate MEM-stage module: the data memory is outside the CPU, so th
 IF_stage → IF_ID_reg → ID_stage → ID_EX_reg → EX_stage → EX_MEM_reg → (AHB bus) → MEM_WB_reg → load_extend / result_mux → (register file)
 ```
 
-- **IF**: PC register, PC+4 adder, branch predictor, PC mux (trap / EX redirect / `mret` / predicted target / PC+4), instruction memory, instruction access fault check
-- **ID**: register file read (with write bypass), immediate extension, control decode, illegal-instruction detection, `mret` detection (redirects PC to `mepc` from here)
+- **IF**: PC register, PC+4 adder, branch predictor (backward branches, and `jal` always), PC mux (trap / EX redirect / `mret` / predicted target / PC+4), instruction memory, instruction access fault check
+- **ID**: register file read (with write bypass), immediate extension, control decode, illegal-instruction detection (including a write to a read-only CSR), `mret` detection (redirects PC to `mepc` from here)
 - **EX**: ALU, branch resolution, `jalr`/`auipc` handling, CSR read/write value computation, misaligned-access detection, interrupt acceptance point
 - **MEM**: the **address phase** of a load/store goes out on the bus (`HADDR`, `HWRITE`, `HSIZE`, `HTRANS`) from the `EX_MEM_reg` outputs
-- **WB**: the **data phase** of the same load/store happens while it sits in WB (`HRDATA` comes back, `HWDATA` goes out, a bus ERROR arrives). `load_extend` extends the data, `result_mux` selects ALU result / memory data / PC+4 / old CSR value
+- **WB**: the **data phase** of the same load/store happens while it sits in WB (`HRDATA` comes back, `HWDATA` goes out, a bus ERROR arrives). `load_extend` extends the data, `result_mux` selects ALU result / memory data / PC+4 / old CSR value. An instruction **retires** here (counted by `minstret`) if its `Valid` bit is set, the stage is not frozen and it took no bus error
 
 ### Hazard Control
 
 - **Forwarding**: EX/MEM has priority over MEM/WB. The EX/MEM candidate is `ALUResult` normally, `PC+4` for `jal`/`jalr`, and the old CSR value for CSR reads.
-- **Stalling**: a load in EX whose destination matches a source of the instruction in ID holds the pipeline one cycle. Stalling is suppressed while an `mret` is in ID (its `rs2` field bits are not a register, so it would otherwise stall falsely).
-- **Flush**: a mispredicted branch or a jump resolves in EX and flushes the two younger instructions.
+- **Stalling**: a load in EX holds the pipeline one cycle only if the instruction in ID reads the register the load writes. rs1 is read by `jalr`, loads, stores, ALU-immediate, ALU-register, branches and the register forms of CSR instructions; rs2 is read by branches, stores and ALU-register instructions. `lui`, `auipc`, `jal`, the CSR-immediate forms, `ecall`, `ebreak` and `mret` read no register, so they never stall, even if their immediate bits happen to match the loaded register number.
+- **Flush**: a mispredicted branch or a `jalr` resolves in EX and flushes the two younger instructions. `jal` no longer flushes, because it is redirected in IF.
 - **Bus wait (`HREADY` low)**: the whole pipeline freezes (see below).
 
 ---
@@ -165,10 +169,26 @@ Not implemented yet: more than one slave (address decoder, per-slave `HSEL`, `HR
 | `0x344` | `mip` | Read-only. Bit 11 = keyboard or disk pending. Writes ignored |
 | `0x7C0` | `current_priority` | Custom (spec's custom machine-mode range). Level of the running code |
 | `0x7C1` | `previous_priority` | Custom. Level that was interrupted |
+| `0xB00` / `0xB80` | `mcycle` / `mcycleh` | 64-bit cycle counter, low / high half. Read-write. Counts every clock, including stall and wait-state cycles |
+| `0xB02` / `0xB82` | `minstret` / `minstreth` | 64-bit instructions-retired counter, low / high half. Read-write |
+| `0xC00` / `0xC80` | `cycle` / `cycleh` | Read-only copy of `mcycle` / `mcycleh` (same counter, different address) |
+| `0xC02` / `0xC82` | `instret` / `instreth` | Read-only copy of `minstret` / `minstreth` |
+| `0xF11` | `mvendorid` | Read-only, reads 0 |
+| `0xF12` | `marchid` | Read-only, reads 0 |
+| `0xF13` | `mimpid` | Read-only, reads 0 |
+| `0xF14` | `mhartid` | Read-only, reads 0 (one hart) |
 
-Accessing any other CSR address raises an illegal-instruction exception (cause 2).
+Accessing any other CSR address raises an illegal-instruction exception (cause 2). So does **writing** a read-only CSR (address bits [11:10] = `11`: the identification CSRs and the `cycle` / `instret` copies). `csrrs`/`csrrc` with `rs1` = x0 and `csrrsi`/`csrrci` with `uimm` = 0 only read, so they are allowed on read-only CSRs.
 
-Reset values: `MIE` = 0 and `MPIE` = 0, so **interrupts are off after reset**. Software must set `mie[11]` and then `mstatus.MIE` before an interrupt can be taken.
+Reset values: `MIE` = 0 and `MPIE` = 0, so **interrupts are off after reset**. Software must set `mie[11]` and then `mstatus.MIE` before an interrupt can be taken. `mcycle` and `minstret` reset to 0.
+
+### Counters
+
+- `mcycle` is a 64-bit register that adds 1 every clock.
+- `minstret` is a 64-bit register that adds 1 for every instruction that **retires**: one that is in WB with its `Valid` bit set, while `HREADY` is high and no bus error occurs. Bubbles, instructions squashed by a flush or an interrupt, and instructions that trap (including `ecall` and `ebreak`) are not counted. An instruction squashed by an interrupt is counted once, when it re-executes after `mret`. `mret` and ordinary `nop`s are counted.
+- CSR instructions read and write in EX, while retirement happens in WB. So a read of `minstret` returns the stored count plus the older instructions still in MEM and WB that are about to retire: it reflects every older instruction and nothing younger.
+- A write to one half replaces that half of the 64-bit value; the other half is kept. The writing instruction itself is not counted. A write wins over an increment in the same clock.
+- Reading the two halves is two separate instructions, so software that needs a consistent 64-bit value reads high, low, high and repeats if the high halves differ.
 
 ---
 
@@ -263,7 +283,7 @@ Exceptions are synchronous: they come from the instruction itself. They use the 
 | 7 | Store access fault: the slave answered a store with an **ERROR response** | WB (bus response) | the bad address |
 | 11 | `ecall` | ID | 0 |
 
-**Illegal instruction** covers: unknown opcode, illegal `funct3`, illegal `funct7`, an unimplemented CSR address, and a SYSTEM instruction with `funct3 = 000` whose immediate is not `ecall`, `ebreak`, `mret` or `wfi`.
+**Illegal instruction** covers: unknown opcode, illegal `funct3`, illegal `funct7`, an unimplemented CSR address, a **write to a read-only CSR**, and a SYSTEM instruction with `funct3 = 000` whose immediate is not `ecall`, `ebreak`, `mret` or `wfi`.
 
 ### Load/store access faults come from the bus
 
@@ -280,7 +300,7 @@ There is no address-range check in the CPU. The slave is the only judge of out-o
 - On entry `mstatus.MPIE <= mstatus.MIE` and `mstatus.MIE <= 0`.
 - **Priority when several things happen in the same cycle**: bus error > interrupt > exception from EX > exception from ID. The bus error belongs to the oldest instruction (WB), so it always goes first. An interrupt beats an exception: the instruction is squashed and re-faults after `mret`.
 - An exception from EX squashes the instruction in EX. An exception from ID lets the older instruction in EX finish first.
-- An exception behind a mispredicted branch or a jump is on the wrong path and is ignored.
+- An exception behind a mispredicted branch or a `jalr` is on the wrong path and is ignored.
 - When several causes occur in the same cycle, the order is: bus error, misaligned access, instruction address misaligned, instruction access fault, `ecall`, `ebreak`, illegal instruction.
 - Exceptions do not change `current_priority`; the entry saves it into `previous_priority`.
 
@@ -299,7 +319,7 @@ An interrupt can simply wait (see the gate above), but an exception cannot move 
 | **`ex_hold`**: exception pending in **EX** (misaligned access, bad jump/branch target) with a load/store in MEM | B stays in EX. `pc`, `IF_ID_reg` and `ID_EX_reg` freeze (`pipe_ready` low); `EX_MEM_reg` takes a bubble, so B's own access never reaches the bus. `ID_EX_reg` also **captures B's forwarded operands**, because the instruction that supplied them leaves the pipeline during the hold and the forwarding source disappears |
 | **`id_hold`**: exception pending in **ID** (illegal, `ecall`, `ebreak`, fetch fault) with a load/store in MEM | B stays in ID. Treated like the load-use stall: `pc` and `IF_ID_reg` freeze, `ID_EX_reg` takes a bubble. The older instruction in EX moves on normally |
 
-Next cycle A is in WB. If A errors, `bus_error` traps for A and squashes B (B re-runs after `mret`). If not, B traps normally. There is no deadlock: after the hold, MEM holds a bubble (or an older instruction that is not stuck), so the gate turns off. An ID instruction behind a mispredicted branch or jump is on the wrong path and is flushed, not held.
+Next cycle A is in WB. If A errors, `bus_error` traps for A and squashes B (B re-runs after `mret`). If not, B traps normally. There is no deadlock: after the hold, MEM holds a bubble (or an older instruction that is not stuck), so the gate turns off. An ID instruction behind a mispredicted branch or a `jalr` is on the wrong path and is flushed, not held.
 
 The holds only matter when `HREADY = 1`; while `HREADY` is low everything is frozen anyway.
 
@@ -353,10 +373,10 @@ So with the same exceptions taken, everything except `x23` must be identical to 
 
 | Mode | Slave behaviour | Reference run length |
 |---|---|---|
-| 0 | no wait states | 579 cycles |
-| 1 | every transfer waits 1 cycle | 660 cycles |
-| 2 | every transfer waits 2 cycles | 741 cycles |
-| 3 | pseudo-random 0..3 waits per transfer (fixed per cycle number) | 701 cycles |
+| 0 | no wait states | 541 cycles |
+| 1 | every transfer waits 1 cycle | 622 cycles |
+| 2 | every transfer waits 2 cycles | 703 cycles |
+| 3 | pseudo-random 0..3 waits per transfer (fixed per cycle number) | 663 cycles |
 
 **Parts of each mode**
 
@@ -375,13 +395,13 @@ So with the same exceptions taken, everything except `x23` must be identical to 
 - **Bus error monitor**: in every bus-error cycle `HTRANS` is IDLE, no register is written, no interrupt or other exception is taken, and the slave is in `ERR2`. In the next cycle `mepc`/`mcause`/`mtval` must hold the faulting load/store's PC, cause 5 or 7, and the bad address (the instruction at that PC must really be a load or a store, and the address must be outside data memory). It also counts how often an interrupt was ready to fire in the very cycle of a bus error (the bus error must win; this must happen at least once).
 - **Coverage check**: for every instruction address where the interrupt gate was open at least once in the reference run, the sweep must have landed an interrupt there. A miss is a "hole" and fails the test. Addresses that are never open are blocked by design: before `MIE` is on, inside `MIE = 0` windows, right behind a load/store, and on `mret`.
 
-**Result (from the run that was checked):** 8763 runs across the four modes, **0 failures, 0 coverage holes**, `=== ALL CHECKS PASSED ===` in all four modes. In the reference run, 137 of 197 executed instruction addresses were open to an interrupt (an interrupt landed on all of them); the other 60 are blocked by design as listed above.
+**Result (from the latest run):** 8307 runs across the four modes, **0 failures, 0 coverage holes**, `=== ALL CHECKS PASSED ===` in all four modes. In the reference run, 137 of 197 executed instruction addresses were open to an interrupt (an interrupt landed on all of them); the other 60 are blocked by design as listed above. The reference run is shorter than before (579 to 541 cycles in mode 0) because `jal` no longer flushes: every executed `jal` saves 2 cycles.
 
 ### Official riscv-tests (rv32ui)
 
 The core also runs the `rv32ui` suite from the official `riscv-tests` repository, built with a custom minimal `riscv_test.h` (not the stock environment, which needs privileged setup this SoC does not use). `tb_rv.v` (module `tb_rv`) runs one test per simulation.
 
-**Result: 40 of 40 tests pass at 0, 1 and 2 wait states per transfer.**
+**Result: 40 of 40 tests pass at 0, 1 and 2 wait states per transfer.** *(Measured before the load-use stall fix, `jal`-in-IF and the CSR/counter changes. Re-run pending: update this line with the result.)*
 
 - **Pass / fail protocol.** `TESTNUM` lives in `x3`. A pass sets `x10 = 0`; a fail sets `x10 = (test number << 1) | 1`. Both set `x30 = 99` and loop. The testbench prints PASS only if `x10 = 0` and no exception was taken. A FAIL line reports `x10`, the failing check number, `x3`, the exception count, `mepc` and `mcause`.
 - **Memory layout.** `.text` is linked at address 0 and loaded through `+hex=` into the instruction memory (testbench overrides its depth to 1024 words, no RTL change). `.data` is linked at address 0 too and loaded straight into the slave's byte array through `+data=`. The largest `.data` is 80 bytes, which fits the 256-byte data memory.
@@ -407,6 +427,8 @@ Scope:
 - Interrupts are not taken while a load/store is in MEM (they wait one cycle).
 - The slave's `ERR2` ignores a transfer accepted in that cycle if the master did not cancel it (the CPU master always cancels).
 - The register file and data memory have no reset; the testbench clears them itself on every reset.
+- No `time` CSR, `mcountinhibit`, `mcounteren` or hardware performance-monitor counters.
+- `tb_sweep` never reads the new identification or counter CSRs, so they have no self-checking test in this repository.
 
 ---
 
@@ -440,7 +462,7 @@ On Windows, GTKWave can be launched with `"C:\iverilog\gtkwave\bin\gtkwave.exe" 
 
 ## Version Control
 
-- `main` — current 5-stage pipeline with forwarding, stalling, priority-based nested interrupts, exceptions, the official-spec CSR set and the AHB-Lite data bus
+- `main` — current 5-stage pipeline with forwarding, stalling, `jal` redirected in IF, priority-based nested interrupts, exceptions, the machine-mode CSR set including the identification CSRs and the cycle/instret counters, and the AHB-Lite data bus
 - `pipeline` — development branch where forwarding/stalling and interrupt handling were built and verified before merging
 
 The original single-cycle implementation remains in the commit history prior to the pipeline merge.

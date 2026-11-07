@@ -66,6 +66,8 @@ sign_extender sign_extender_inst
 illegal_csr_addr illegal_csr_addr_inst
 (
     .csr_addr(Instr_In[31:20]),
+    .funct3(Instr_In[14:12]),
+    .rs1(Instr_In[19:15]),
     .IsCSR(IsCSR),
     .illegal_csr_address(illegal_csr_address)
 );

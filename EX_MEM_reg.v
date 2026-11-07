@@ -5,12 +5,12 @@ module EX_MEM_reg
     input [4:0] WA_In,
     input [2:0] Funct3_In,
     input [1:0] Width_In, ResultSrc_In,
-    input RegWrite_In, IsLoad_In, MemWrite_In,
+    input RegWrite_In, IsLoad_In, MemWrite_In, Valid_In,
     output reg [31:0] PC_Plus_4_Out, ALUResult_Out, RD2_Out, csr_read_val_Out,
     output reg [4:0] WA_Out,
     output reg [2:0] Funct3_Out,
     output reg [1:0] Width_Out, ResultSrc_Out,
-    output reg RegWrite_Out, IsLoad_Out, MemWrite_Out
+    output reg RegWrite_Out, IsLoad_Out, MemWrite_Out, Valid_Out
 );
 
 always @(posedge clk or posedge reset)
@@ -29,6 +29,7 @@ begin
         RegWrite_Out <= 1'b0;
         MemWrite_Out <= 1'b0;
         IsLoad_Out <= 1'b0;
+        Valid_Out <= 1'b0;
     end
 
     else if(~HREADY)
@@ -44,6 +45,7 @@ begin
         RegWrite_Out <= RegWrite_Out;
         MemWrite_Out <= MemWrite_Out;
         IsLoad_Out <= IsLoad_Out; 
+        Valid_Out <= Valid_Out;
     end
 
     else if (interrupt_taken | exception_taken_EX)
@@ -59,6 +61,7 @@ begin
         RegWrite_Out <= 1'b0;
         MemWrite_Out <= 1'b0;
         IsLoad_Out <= 1'b0;
+        Valid_Out <= 1'b0;
     end
 
     else
@@ -74,6 +77,7 @@ begin
         MemWrite_Out <= MemWrite_In;
         Funct3_Out <= Funct3_In;
         IsLoad_Out <= IsLoad_In;
+        Valid_Out <= Valid_In;
     end
     
 end

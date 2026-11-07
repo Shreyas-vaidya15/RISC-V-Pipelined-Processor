@@ -20,7 +20,7 @@ wire Predicted_Taken_IF;
 // ---- IF_ID_reg outputs → ID_stage / ID_EX_reg ----
 wire [31:0] PC_ID, PCPlus4_ID, Instr_ID;
 wire Predicted_Taken_ID;
-wire Valid_ID, Valid_EX;   // 1 = real instruction, 0 = bubble (flush / stall / reset)
+wire Valid_ID, Valid_EX, Valid_MEM, Valid_WB;   // 1 = real instruction, 0 = bubble (flush / stall / reset)
 wire instruction_access_fault_IF, instruction_access_fault_ID;   // out-of-range fetch: flagged in IF, carried to ID by IF_ID_reg
 
 // ---- ID_stage outputs → ID_EX_reg ----
@@ -253,6 +253,10 @@ wire [31:0] csr_wdata;
 // Address-match signals: "which CSR is this instruction pointing at" (used for READING).
 wire mepc_sel, mie_sel, mcause_sel, current_priority_sel, previous_priority_sel, mpie_sel, mtval_sel, mtvec_sel, mie_csr_sel, mip_sel, mscratch_sel, misa_sel;
 
+// Counters (mcycle/minstret and their read-only user copies)
+wire mcycle_sel, mcycleh_sel, minstret_sel, minstreth_sel, cycle_sel, cycleh_sel, instret_sel, instreth_sel;
+wire [31:0] mcycle_lo, mcycle_hi, minstret_lo, minstret_hi;
+
 // New CSRs
 wire [31:0] mscratch_val, misa_val;
 
@@ -273,6 +277,15 @@ assign mtval_write_en             = mtval_sel             & csr_write_EX;
 assign mtvec_write_en             = mtvec_sel             & csr_write_EX & ~interrupt_taken;
 assign mie_csr_write_en           = mie_csr_sel           & csr_write_EX & ~interrupt_taken;
 assign mscratch_write_en          = mscratch_sel          & csr_write_EX & ~interrupt_taken;
+
+// Counter writes: only the m-versions can be written (a write to cycle/instret traps in ID). Same gating as mscratch.
+wire mcycle_wr_lo    = mcycle_sel    & csr_write_EX & ~interrupt_taken;
+wire mcycle_wr_hi    = mcycleh_sel   & csr_write_EX & ~interrupt_taken;
+wire minstret_wr_lo  = minstret_sel  & csr_write_EX & ~interrupt_taken;
+wire minstret_wr_hi  = minstreth_sel & csr_write_EX & ~interrupt_taken;
+
+// An instruction retires when it is in WB, the stage is not frozen, and it did not take a bus error
+wire retire_WB = Valid_WB & HREADY & ~bus_error;
 // mip (0x344) is read-only: no write path.
 // misa (0x301) is WARL and hardwired: writes are silently ignored, no write path, no exception.
 wire [31:0] csr_read_val_EX;
@@ -428,6 +441,8 @@ ID_EX_reg ID_EX_reg_inst
 stall_unit stall_unit_inst
 (
     .ID_EX_opcode(Instr_EX[6:0]),
+    .IF_ID_opcode(Instr_ID[6:0]),
+    .IF_ID_funct3(Instr_ID[14:12]),
     .IF_ID_rs1(Instr_ID[19:15]),
     .IF_ID_rs2(Instr_ID[24:20]),
     .ID_EX_WA(WA_EX),
@@ -495,6 +510,8 @@ EX_MEM_reg EX_MEM_reg_inst
 (
     .clk(clk),
     .reset(reset),
+    .Valid_In(Valid_EX),
+    .Valid_Out(Valid_MEM),
     .interrupt_taken(interrupt_taken),
     .exception_taken_EX(exception_taken_EX | bus_error | ex_hold),
     .HREADY(HREADY),
@@ -545,6 +562,8 @@ MEM_WB_reg MEM_WB_reg_inst
 (
     .clk(clk),
     .reset(reset),
+    .Valid_In(Valid_MEM),
+    .Valid_Out(Valid_WB),
     .HREADY(HREADY),
     .bus_error(bus_error),
     .PC_Plus_4_In(PCPlus4_MEM),
@@ -766,6 +785,22 @@ misa misa_inst
     .misa_out(misa_val)
 );
 
+csr_counters csr_counters_inst
+(
+    .clk(clk),
+    .reset(reset),
+    .mcycle_wr_lo(mcycle_wr_lo),
+    .mcycle_wr_hi(mcycle_wr_hi),
+    .minstret_wr_lo(minstret_wr_lo),
+    .minstret_wr_hi(minstret_wr_hi),
+    .csr_wdata(csr_wdata),
+    .retire(retire_WB),
+    .mem_valid(Valid_MEM),
+    .mcycle_lo(mcycle_lo),
+    .mcycle_hi(mcycle_hi),
+    .minstret_lo(minstret_lo),
+    .minstret_hi(minstret_hi)
+);
 csr_addr_decoder csr_addr_decoder_inst
 (
     .csr_addr(Instr_EX[31:20]),
@@ -781,7 +816,15 @@ csr_addr_decoder csr_addr_decoder_inst
     .mie_csr_sel(mie_csr_sel),
     .mip_sel(mip_sel),
     .mscratch_sel(mscratch_sel),
-    .misa_sel(misa_sel)
+    .misa_sel(misa_sel),
+    .mcycle_sel(mcycle_sel),
+    .mcycleh_sel(mcycleh_sel),
+    .minstret_sel(minstret_sel),
+    .minstreth_sel(minstreth_sel),
+    .cycle_sel(cycle_sel),
+    .cycleh_sel(cycleh_sel),
+    .instret_sel(instret_sel),
+    .instreth_sel(instreth_sel)
 );
 
 csr_write_data csr_write_data_inst
@@ -807,6 +850,18 @@ csr_read_data csr_read_data_inst
     .mip_sel(mip_sel),
     .mscratch_sel(mscratch_sel),
     .misa_sel(misa_sel),
+    .mcycle_sel(mcycle_sel),
+    .mcycleh_sel(mcycleh_sel),
+    .minstret_sel(minstret_sel),
+    .minstreth_sel(minstreth_sel),
+    .cycle_sel(cycle_sel),
+    .cycleh_sel(cycleh_sel),
+    .instret_sel(instret_sel),
+    .instreth_sel(instreth_sel),
+    .mcycle_lo(mcycle_lo),
+    .mcycle_hi(mcycle_hi),
+    .minstret_lo(minstret_lo),
+    .minstret_hi(minstret_hi),
     .pending_keyboard(pending_keyboard),
     .pending_disk(pending_disk),
     .mie_csr_val(mie_csr_val),

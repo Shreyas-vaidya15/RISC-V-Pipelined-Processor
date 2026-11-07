@@ -1,6 +1,8 @@
 module csr_read_data
 (
     input mepc_sel, mie_sel, mcause_sel, mie_val, current_priority_sel, previous_priority_sel, mpie_sel, mpie_val, mtval_sel, mtvec_sel, mie_csr_sel, mip_sel, mscratch_sel, misa_sel,
+    input mcycle_sel, mcycleh_sel, minstret_sel, minstreth_sel, cycle_sel, cycleh_sel, instret_sel, instreth_sel,
+    input [31:0] mcycle_lo, mcycle_hi, minstret_lo, minstret_hi,
     input pending_keyboard, pending_disk,
     input [31:0] mepc_val, mcause_val, mtval_val, mtvec_val, mie_csr_val, mscratch_val, misa_val,
     input [1:0] current_priority, previous_priority,
@@ -21,6 +23,10 @@ begin
     if(mip_sel) csr_read_val = {20'b0, (pending_keyboard | pending_disk), 11'b0};
     if(mscratch_sel) csr_read_val = mscratch_val;
     if(misa_sel) csr_read_val = misa_val;
+    if(mcycle_sel | cycle_sel) csr_read_val = mcycle_lo;
+    if(mcycleh_sel | cycleh_sel) csr_read_val = mcycle_hi;
+    if(minstret_sel | instret_sel) csr_read_val = minstret_lo;
+    if(minstreth_sel | instreth_sel) csr_read_val = minstret_hi;
 end
 
 endmodule

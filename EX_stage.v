@@ -17,7 +17,7 @@ wire IsAuipc = (Instr[6:0] == 7'b0010111);
 wire BranchDecision;
 assign Actual_Taken = BranchDecision ^ Instr[12];
 assign Mispredict = (Branch & (Actual_Taken ^ Predicted_Taken));
-assign EX_Override = Jump | Mispredict;
+assign EX_Override = (Jump & IsJalr) | Mispredict;
 assign IsJalr = (Instr[6:0] == 7'b1100111);
 
 always@(*)

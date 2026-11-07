@@ -23,8 +23,11 @@ instruction_access_fault #(.DEPTH(DEPTH)) instruction_access_fault_inst
 // so both of them only ever see a clean instruction.
 assign Instr = instruction_access_fault ? NOP : Instr_raw;
 
-assign Predicted_Taken = (Instr[31] & (Instr[6:0] == 7'b1100011));
-assign ImmExt = {{20{Instr[31]}}, Instr[7], Instr[30:25], Instr[11:8], 1'b0};
+// JAL always jumps, so it is redirected here in fetch; EX_stage no longer redirects for it
+wire is_jal = (Instr[6:0] == 7'b1101111);
+assign Predicted_Taken = (Instr[31] & (Instr[6:0] == 7'b1100011)) | is_jal;
+// J-type immediate for JAL, B-type immediate for branches
+assign ImmExt = is_jal ? {{12{Instr[31]}}, Instr[19:12], Instr[20], Instr[30:21], 1'b0} : {{20{Instr[31]}}, Instr[7], Instr[30:25], Instr[11:8], 1'b0};
 
 pc_plus_4 pc_plus_4_inst(
     .PC(PC),

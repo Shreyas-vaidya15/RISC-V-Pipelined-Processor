@@ -10,20 +10,25 @@ module top
   output [1:0]  HTRANS,
   output [2:0]  HSIZE,
   output [31:0] HADDR,
-  output [31:0] HWDATA
+  output [31:0] HWDATA,
+
+  // ---- AHB-Lite master side (instruction bus, fetch only) ----
+  input  [31:0] IHRDATA,
+  output [1:0]  IHTRANS,
+  output [31:0] IHADDR
 );
 
-// ---- IF stage outputs → IF_ID_reg ----
+// ---- IF stage outputs -> IF_ID_reg ----
 wire [31:0] PC_IF, PCPlus4_IF, Instr_IF;
-wire Predicted_Taken_IF;
+wire Predicted_Taken_IF, Valid_IF;   // Valid_IF: 1 = a real instruction is in its data phase, 0 = nothing arrived this cycle
 
-// ---- IF_ID_reg outputs → ID_stage / ID_EX_reg ----
+// ---- IF_ID_reg outputs -> ID_stage / ID_EX_reg ----
 wire [31:0] PC_ID, PCPlus4_ID, Instr_ID;
 wire Predicted_Taken_ID;
 wire Valid_ID, Valid_EX, Valid_MEM, Valid_WB;   // 1 = real instruction, 0 = bubble (flush / stall / reset)
 wire instruction_access_fault_IF, instruction_access_fault_ID;   // out-of-range fetch: flagged in IF, carried to ID by IF_ID_reg
 
-// ---- ID_stage outputs → ID_EX_reg ----
+// ---- ID_stage outputs -> ID_EX_reg ----
 wire [31:0] RD1_ID, RD2_ID, ImmExt_ID;
 wire [4:0] WA_ID;
 wire [3:0] ALUControl_ID;
@@ -40,7 +45,7 @@ wire illegal_funct3_ID;
 wire IsLoad_ID, IsLoad_EX;   // instruction is a load (needed in EX for the misaligned check, and later for AHB)
 assign illegal_funct3_ID = illegal_funct3_func | illegal_funct3_csr;
 
-// ---- ID_EX_reg outputs → EX_stage / EX_MEM_reg ----
+// ---- ID_EX_reg outputs -> EX_stage / EX_MEM_reg ----
 wire [31:0] PC_EX, PCPlus4_EX, RD1_EX, RD2_EX, ImmExt_EX, Instr_EX;
 wire [4:0] WA_EX;
 wire [3:0] ALUControl_EX;
@@ -49,11 +54,11 @@ wire [1:0] Width_EX, ResultSrc_EX;
 wire RegWrite_EX, ALUSrc_EX, MemWrite_EX, Branch_EX, Jump_EX, Predicted_Taken_EX, IsCSR_EX;
 wire Mret_EX;   // an mret is currently sitting in EX (carried through ID_EX_reg)
 
-// ---- EX_stage outputs → EX_MEM_reg (+ feedback to IF_stage) ----
+// ---- EX_stage outputs -> EX_MEM_reg (+ feedback to IF_stage) ----
 wire [31:0] Result_EX, PCTarget_EX, EX_RedirectPC_EX;
 wire IsJalr_EX, EX_Override_EX, Actual_Taken_EX;
 
-// ---- EX_MEM_reg outputs → MEM_stage / MEM_WB_reg ----
+// ---- EX_MEM_reg outputs -> MEM_stage / MEM_WB_reg ----
 wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM, csr_read_val_MEM;
 wire [4:0] WA_MEM;
 wire [2:0] Funct3_MEM;
@@ -62,14 +67,14 @@ wire RegWrite_MEM, MemWrite_MEM, IsLoad_MEM;
 
 // ---- (no MEM_stage module any more: the data memory is an AHB slave outside the CPU) ----
 
-// ---- MEM_WB_reg outputs → result_mux / id_stage feedback ----
+// ---- MEM_WB_reg outputs -> result_mux / id_stage feedback ----
 wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB, RD2_WB;   // ReadData_WB = load_extend output (HRDATA extended)
 wire [4:0] WA_WB;
 wire [1:0] ResultSrc_WB;
 wire RegWrite_WB, IsLoad_WB, MemWrite_WB;
 wire [2:0] Funct3_WB;
 
-// ---- result_mux output → id_stage write-back (also doubles as MEM/WB forwarding candidate) ----
+// ---- result_mux output -> id_stage write-back (also doubles as MEM/WB forwarding candidate) ----
 wire [31:0] Result_WB;
 
 // ---- raw-field slice needed before ID_EX_reg ----
@@ -330,7 +335,11 @@ IF_stage IF_stage_inst
     .PCPlus4(PCPlus4_IF),
     .Instr(Instr_IF),
     .Predicted_Taken(Predicted_Taken_IF),
-    .instruction_access_fault(instruction_access_fault_IF)
+    .instruction_access_fault(instruction_access_fault_IF),
+    .Valid(Valid_IF),
+    .HRDATA_fetch(IHRDATA),
+    .HADDR_fetch(IHADDR),
+    .HTRANS_fetch(IHTRANS)
 );
 
 IF_ID_reg IF_ID_reg_inst
@@ -344,6 +353,7 @@ IF_ID_reg IF_ID_reg_inst
     .exception_taken(exception_taken),
     .pipe_ready(pipe_ready),
     .Predicted_Taken_In(Predicted_Taken_IF),
+    .Valid_In(Valid_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
     .PC_Plus_4_In(PCPlus4_IF),

@@ -58,10 +58,11 @@ soc_top soc_inst (
 
 // 4 KB of instruction memory (DEPTH is in words); also moves the instruction_access_fault limit
 defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 1024;
+defparam soc_inst.inst_slave_inst.DEPTH = 1024;
 
 `define CPU     soc_inst.cpu_inst
 `define SLAVE   soc_inst.data_slave_inst
-`define IM      soc_inst.cpu_inst.IF_stage_inst.instruction_memory_inst
+`define IM      soc_inst.inst_slave_inst.inst_memory_inst
 `define REG(n)  soc_inst.cpu_inst.ID_stage_inst.register_file_inst.registers[n]
 `define DMEM(i) soc_inst.data_slave_inst.data_memory_inst.mem[i]
 

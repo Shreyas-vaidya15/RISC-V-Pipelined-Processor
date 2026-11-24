@@ -8,7 +8,8 @@ integer cyc, excs, w;
 reg [8*256-1:0] datafile;
 
 soc_top soc_inst (.clk(clk), .reset(reset), .interrupt_keyboard(1'b0), .interrupt_disk(1'b0), .WAIT_CYCLES(wait_cycles));
-defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 1024;
+defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 1024;   // instruction_access_fault limit (words)
+defparam soc_inst.inst_slave_inst.DEPTH = 1024;              // instruction memory size (words): keep equal to the line above
 
 `define RV_CPU soc_inst.cpu_inst
 `define RV_REG(n) soc_inst.cpu_inst.ID_stage_inst.register_file_inst.registers[n]

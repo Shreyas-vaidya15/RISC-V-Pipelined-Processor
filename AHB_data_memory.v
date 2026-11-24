@@ -1,4 +1,5 @@
-module AHB_data_memory #(parameter DEPTH = 64)   // DEPTH is in WORDS; passed down to data_memory so the size lives in one place
+module AHB_data_memory #(parameter DEPTH = 64,             // DEPTH is in WORDS; passed down to data_memory so the size lives in one place
+                         parameter [31:0] BASE = 32'h10000000)   // address of this slave on the bus; the memory sees HADDR - BASE
 (
     input HCLK,
     input HRESETn,
@@ -37,7 +38,8 @@ reg [31:0] addr_dp;
 
 // ---------------- trigger (looks at the LIVE address phase, HADDR, not addr_dp) ----------------
 wire accepted     = HSEL && HTRANS[1] && HREADY;
-wire out_of_range = (HADDR >= DEPTH * 4);          // start address only: misaligned accesses never get here
+wire [31:0] offset = HADDR - BASE;                 // address inside this slave
+wire out_of_range = (offset >= DEPTH * 4);          // start address only: misaligned accesses never get here
 wire bad_transfer = accepted && out_of_range;
 
 // ---------------- saved address phase ----------------
@@ -58,7 +60,7 @@ begin
         valid_dp <= HSEL && HTRANS[1];
         bad_dp <= bad_transfer;
         size_dp <= HSIZE[1:0];
-        addr_dp <= HADDR;
+        addr_dp <= offset;
     end
 end
 
@@ -70,7 +72,7 @@ begin
         wait_cnt <= 4'd0;
     end
 
-    else if(state == S_OKAY && accepted && WAIT_CYCLES != 4'd0)
+    else if((state == S_OKAY || state == S_ERR2) && accepted && WAIT_CYCLES != 4'd0)
     begin
         wait_cnt <= WAIT_CYCLES - 4'd1;
     end
@@ -102,12 +104,15 @@ begin
 
     case(state)
 
-    S_OKAY:
+    // S_ERR2 also accepts a new transfer: the master only cancels the next address after a load/store error
+    S_OKAY, S_ERR2:
     begin
         if(accepted && WAIT_CYCLES != 4'd0)
             next_state = S_WAIT;             // wait first (bad_dp is latched at this same edge)
         else if(bad_transfer)
             next_state = S_ERR1;             // no wait needed: error starts right away
+        else
+            next_state = S_OKAY;
     end
 
     S_WAIT:
@@ -117,8 +122,6 @@ begin
     end
 
     S_ERR1: next_state = S_ERR2;
-
-    S_ERR2: next_state = S_OKAY;
 
     default: next_state = S_OKAY;
 

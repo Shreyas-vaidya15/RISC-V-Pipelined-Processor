@@ -1,8 +1,9 @@
 `timescale 1ns/1ps
 
 // ============================================================================================
-// INTERRUPT SWEEP TESTBENCH, stage 4: AHB-Lite with wait states AND bus errors.  DUT = soc_top (CPU + AHB data slave).
-// Pairs with the stage 4 "INTERRUPT SWEEP IMAGE" instruction_memory.v (section S8 takes 11 bus errors on purpose).
+// INTERRUPT SWEEP TESTBENCH, stage 5: ONE shared AHB-Lite bus (fetch + load/store), wait states, bus errors, fetch faults.
+// DUT = soc_top (CPU + interconnect + instruction slave + data slave + default slave).
+// Pairs with the stage 5 "INTERRUPT SWEEP IMAGE" instruction_memory.v (S8 + S10 take 15 bus errors and S10 5 fetch faults on purpose).
 //
 // Build (leave out any other testbench):
 //   iverilog -s tb_sweep -o sim_sweep <all .v files, one testbench only>
@@ -24,10 +25,11 @@
 // Part 3b  reset while the slave answers with ERROR (k = 0..5 cycles after the response starts), several error responses.
 //
 // Always running (every cycle of every run):
-//   AHB hold monitor: if HREADY was low in the previous cycle, HADDR / HTRANS / HWRITE / HSIZE / HWDATA must be unchanged,
-//                     with ONE exception: in the last cycle of an ERROR response (HRESP=1, HREADY=1) HTRANS may change to IDLE.
+//   AHB hold monitor: if HREADY was low in the previous cycle and a transfer (NONSEQ) was pending, HADDR / HTRANS / HWRITE / HSIZE / HWDATA
+//                     must be unchanged, with ONE exception: in the last cycle of an ERROR response (HRESP=1, HREADY=1) HTRANS may change to IDLE.
+//                     (An IDLE address phase has nothing pending: the master may present the fetch once HREADY is high again.)
 //   Bus error monitor: in every bus error cycle HTRANS = IDLE, no register write, no interrupt / other exception in that cycle,
-//                      slave in ERR2; next cycle mepc / mcause / mtval hold the right values for the faulting load/store.
+//                      the slave that answers (instruction, data or default slave) in ERR2; next cycle mepc / mcause / mtval hold the right values for the faulting load/store.
 //
 // The register file and data memory have no reset in the RTL, so this testbench clears them (hierarchically)
 // every time it resets.
@@ -36,6 +38,7 @@
 module tb_sweep();
 
 localparam DMEM_BYTES = 256;      // data_memory DEPTH (64 words) * 4
+localparam [31:0] DMEM_BASE = 32'h10000000;   // must match soc_top's DMEM_BASE
 localparam LIMIT      = 8000;     // cycle limit for one run (hang detection)
 localparam DRAIN      = 40;       // cycles to keep running after the end marker
 localparam EXTRA      = 8;        // sweep this many cycles past the reference end
@@ -56,14 +59,24 @@ soc_top soc_inst (
     .WAIT_CYCLES(wait_cycles)
 );
 
-// 4 KB of instruction memory (DEPTH is in words); also moves the instruction_access_fault limit
-defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 1024;
+// Instruction memory: 4 KB (DEPTH is in words) = one bus window.
+// The fetch range check in IF is set to 8 KB (2048 words) on purpose: a fetch from 0x1000..0x1FFF passes the check, goes out on the
+// bus, finds no slave and comes back from the default slave with an ERROR (S10: fetch fault from the bus). A fetch from 0x2000 or
+// above is caught by the range check and never goes on the bus.
+defparam soc_inst.cpu_inst.IF_stage_inst.DEPTH = 2048;
+defparam soc_inst.inst_slave_inst.DEPTH = 1024;
 
 `define CPU     soc_inst.cpu_inst
 `define SLAVE   soc_inst.data_slave_inst
-`define IM      soc_inst.cpu_inst.IF_stage_inst.instruction_memory_inst
+`define IM      soc_inst.inst_slave_inst.inst_memory_inst
 `define REG(n)  soc_inst.cpu_inst.ID_stage_inst.register_file_inst.registers[n]
 `define DMEM(i) soc_inst.data_slave_inst.data_memory_inst.mem[i]
+`define INTC    soc_inst.interconnect_inst
+
+// state of the slave whose data phase is on the bus now (the one that answers)
+wire [1:0] resp_state = `INTC.dp_imem ? soc_inst.inst_slave_inst.state :
+                        `INTC.dp_dmem ? soc_inst.data_slave_inst.state :
+                                        soc_inst.default_slave_inst.state;
 
 initial clk = 1'b0;
 always #5 clk = ~clk;
@@ -124,8 +137,9 @@ always @(negedge clk) begin
 end
 
 // ---------------- AHB hold monitor (negedge) ----------------
-// If HREADY was low in the previous cycle, nothing the master drives may change in this cycle.
+// If HREADY was low in the previous cycle and a transfer was pending (HTRANS was NONSEQ), nothing the master drives may change.
 // The one allowed change: HTRANS goes to IDLE in the last cycle of an ERROR response (HRESP = 1, HREADY = 1).
+// With one shared bus an IDLE address phase has nothing pending: the master presents a fetch as soon as HREADY is high again.
 reg [31:0] pv_haddr, pv_hwdata;
 reg [1:0]  pv_htrans;
 reg [2:0]  pv_hsize;
@@ -137,7 +151,7 @@ initial begin pv_valid = 1'b0; proto_prints = 0; end
 always @(negedge clk) begin
     if (reset) pv_valid = 1'b0;
     else begin
-        if (pv_valid && !pv_hready) begin
+        if (pv_valid && !pv_hready && pv_htrans[1]) begin
             same_other = (`CPU.HADDR === pv_haddr) && (`CPU.HWRITE === pv_hwrite) &&
                          (`CPU.HSIZE === pv_hsize)  && (`CPU.HWDATA === pv_hwdata);
             same_all   = same_other && (`CPU.HTRANS === pv_htrans);
@@ -196,12 +210,12 @@ always @(negedge clk) begin
             be_pending   = 1'b1;
 
             if (`CPU.HTRANS !== 2'b00 || `CPU.ID_stage_inst.we !== 1'b0 || `CPU.interrupt_taken !== 1'b0 ||
-                `CPU.exception_taken_EX !== 1'b0 || `CPU.exception_taken_ID !== 1'b0 || `SLAVE.state !== 2'd3) begin
+                `CPU.exception_taken_EX !== 1'b0 || `CPU.exception_taken_ID !== 1'b0 || resp_state !== 2'd3 || `CPU.dp_data !== 1'b1) begin
                 errors = errors + 1;
                 if (be_prints < 20)
-                    $display("  [FAIL] mode=%0d: bus error cycle: HTRANS=%b regwrite=%b int_taken=%b exc_EX=%b exc_ID=%b slave state=%0d (expected 00 0 0 0 0 3)",
+                    $display("  [FAIL] mode=%0d: bus error cycle: HTRANS=%b regwrite=%b int_taken=%b exc_EX=%b exc_ID=%b answering slave state=%0d (expected 00 0 0 0 0 3)",
                              wait_mode, `CPU.HTRANS, `CPU.ID_stage_inst.we, `CPU.interrupt_taken, `CPU.exception_taken_EX,
-                             `CPU.exception_taken_ID, `SLAVE.state);
+                             `CPU.exception_taken_ID, resp_state);
                 be_prints = be_prints + 1;
             end
 
@@ -213,7 +227,7 @@ always @(negedge clk) begin
                 be_prints = be_prints + 1;
             end
 
-            if ((be_exp_mtval >= DMEM_BYTES) !== 1'b1) begin
+            if (((be_exp_mtval - DMEM_BASE) >= DMEM_BYTES) !== 1'b1) begin
                 errors = errors + 1;
                 if (be_prints < 20)
                     $display("  [FAIL] mode=%0d: bus error for address 0x%0h, which is inside data memory", wait_mode, be_exp_mtval);
@@ -359,18 +373,19 @@ task compare_to_ref;
                                             kind, N, `CPU.pending_keyboard, `CPU.pending_disk);
         end
 
-        // after the drain no transfer may be in flight and the slave must be idle and ready
-        if (`CPU.HTRANS !== 2'b00) begin
+        // after the drain no LOAD/STORE may be in flight (the CPU parks in a jal x0,0 loop and keeps fetching, so HTRANS is not IDLE),
+        // and every slave must be idle and ready
+        if ((`CPU.IsLoad_MEM | `CPU.MemWrite_MEM) !== 1'b0 || `CPU.dp_data !== 1'b0) begin
             bad = bad + 1;
-            if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: HTRANS = %b at the end, expected IDLE", kind, N, `CPU.HTRANS);
+            if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: a load/store is still on the bus at the end (MEM op=%b data phase=%b)", kind, N, `CPU.IsLoad_MEM | `CPU.MemWrite_MEM, `CPU.dp_data);
         end
         if (`CPU.HREADY !== 1'b1) begin
             bad = bad + 1;
             if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: HREADY low at the end", kind, N);
         end
-        if (`SLAVE.state !== 2'd0 || `SLAVE.HRESP !== 1'b0) begin
+        if (`SLAVE.state !== 2'd0 || `SLAVE.HRESP !== 1'b0 || soc_inst.inst_slave_inst.state !== 2'd0 || soc_inst.default_slave_inst.state !== 2'd0 || `CPU.HRESP !== 1'b0) begin
             bad = bad + 1;
-            if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: slave not idle at the end (state=%0d HRESP=%b)", kind, N, `SLAVE.state, `SLAVE.HRESP);
+            if (prints < MAXPRINT) $display("  [FAIL] kind=%0d N=%0d: a slave is not idle at the end (data=%0d inst=%0d default=%0d HRESP=%b)", kind, N, `SLAVE.state, soc_inst.inst_slave_inst.state, soc_inst.default_slave_inst.state, `CPU.HRESP);
         end
 
         runs = runs + 1;
@@ -430,6 +445,13 @@ task check_reset_state;
         if (`SLAVE.wait_cnt !== 4'd0)                rs_fail(kind, N, k, "slave wait_cnt", `SLAVE.wait_cnt);
         if (`SLAVE.HRESP !== 1'b0)                   rs_fail(kind, N, k, "slave HRESP", `SLAVE.HRESP);
         if (`SLAVE.HREADYOUT !== 1'b1)               rs_fail(kind, N, k, "slave HREADYOUT (expected 1)", `SLAVE.HREADYOUT);
+
+        // the other slaves, the interconnect and the master's data-phase flags
+        if (soc_inst.inst_slave_inst.state !== 2'd0)    rs_fail(kind, N, k, "inst slave state", soc_inst.inst_slave_inst.state);
+        if (soc_inst.default_slave_inst.state !== 2'd0) rs_fail(kind, N, k, "default slave state", soc_inst.default_slave_inst.state);
+        if ({`INTC.dp_imem, `INTC.dp_dmem, `INTC.dp_def} !== 3'b001) rs_fail(kind, N, k, "hsel_dp (expected default slave)", {`INTC.dp_imem, `INTC.dp_dmem, `INTC.dp_def});
+        if (`CPU.dp_data !== 1'b0 || `CPU.dp_fetch !== 1'b0) rs_fail(kind, N, k, "dp_data/dp_fetch", {`CPU.dp_data, `CPU.dp_fetch});
+        if (`CPU.HREADY !== 1'b1 || `CPU.HRESP !== 1'b0) rs_fail(kind, N, k, "bus HREADY/HRESP", {`CPU.HREADY, `CPU.HRESP});
     end
 endtask
 
@@ -477,7 +499,7 @@ task run_mid_reset;
 endtask
 
 // ---------------- reset-in-error-response: one case ----------------
-// Run with no interrupt until the occ-th ERROR response starts (slave in ERR1, the first error cycle).
+// Run with no interrupt until the occ-th load/store ERROR response starts (answering slave in ERR1, the first error cycle).
 // Reset k cycles later (k = 0: during ERR1, k = 1: during ERR2, then the trap and handler start), check the reset state
 // (CPU and slave), then run the whole program again and compare with the reference run.
 task run_err_reset;
@@ -495,7 +517,7 @@ task run_err_reset;
         while (!got && cyc < LIMIT) begin
             @(negedge clk);
             cyc = cyc + 1;
-            if (`SLAVE.state == 2'd2) seen = seen + 1;     // ERR1 lasts one cycle per error response
+            if (`CPU.HRESP === 1'b1 && `CPU.HREADY === 1'b0 && `CPU.dp_data === 1'b1) seen = seen + 1;   // ERR1 of a load/store error (HRESP=1, HREADY=0): one cycle per response, whichever slave answers
             if (seen == occ) got = 1'b1;
         end
 
@@ -631,7 +653,7 @@ task do_mode;
         // Addresses that were never allowed are blocked by design (before MIE is on, MIE = 0 windows, behind a load/store, mret).
         cov_total = 0; cov_hit = 0; cov_listed = 0; cov_allowed = 0; cov_holes = 0;
         for (p = 0; p < 1024; p = p + 1)
-            if (ref_exec[p] && !(p == 25 || (p >= 48 && p < 56))) begin   // exception handler (pc 100, 192..220) runs with MIE = 0
+            if (ref_exec[p] && !(p == 25 || (p >= 48 && p < 64))) begin   // exception handler (pc 100, 192..252) runs with MIE = 0
                 cov_total = cov_total + 1;
                 if (ref_allow[p]) cov_allowed = cov_allowed + 1;
                 if (hit_int[p])   cov_hit = cov_hit + 1;

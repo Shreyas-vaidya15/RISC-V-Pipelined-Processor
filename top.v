@@ -1,8 +1,8 @@
-module top
+module top #(parameter [31:0] IMEM_BASE = 32'h0)
 (
   input clk, reset, interrupt_keyboard, interrupt_disk,
 
-  // ---- AHB-Lite master side (data bus) ----
+  // ---- AHB-Lite master side (ONE shared bus: load/store and instruction fetch) ----
   input         HREADY,
   input         HRESP,
   input  [31:0] HRDATA,
@@ -13,17 +13,22 @@ module top
   output [31:0] HWDATA
 );
 
-// ---- IF stage outputs → IF_ID_reg ----
-wire [31:0] PC_IF, PCPlus4_IF, Instr_IF;
-wire Predicted_Taken_IF;
+// ---- shared bus: arbiter (AHB_master_CPU_interface) <-> IF_stage ----
+wire fetch_req, fetch_grant;       // IF wants the bus / the fetch address is on the bus
+wire [31:0] HADDR_fetch;
+wire dp_data, dp_fetch;            // the transfer in its data phase is a load/store / a fetch
 
-// ---- IF_ID_reg outputs → ID_stage / ID_EX_reg ----
+// ---- IF stage outputs -> IF_ID_reg ----
+wire [31:0] PC_IF, PCPlus4_IF, Instr_IF;
+wire Predicted_Taken_IF, Valid_IF;   // Valid_IF: 1 = a real instruction is in its data phase, 0 = nothing arrived this cycle
+
+// ---- IF_ID_reg outputs -> ID_stage / ID_EX_reg ----
 wire [31:0] PC_ID, PCPlus4_ID, Instr_ID;
 wire Predicted_Taken_ID;
 wire Valid_ID, Valid_EX, Valid_MEM, Valid_WB;   // 1 = real instruction, 0 = bubble (flush / stall / reset)
 wire instruction_access_fault_IF, instruction_access_fault_ID;   // out-of-range fetch: flagged in IF, carried to ID by IF_ID_reg
 
-// ---- ID_stage outputs → ID_EX_reg ----
+// ---- ID_stage outputs -> ID_EX_reg ----
 wire [31:0] RD1_ID, RD2_ID, ImmExt_ID;
 wire [4:0] WA_ID;
 wire [3:0] ALUControl_ID;
@@ -40,7 +45,7 @@ wire illegal_funct3_ID;
 wire IsLoad_ID, IsLoad_EX;   // instruction is a load (needed in EX for the misaligned check, and later for AHB)
 assign illegal_funct3_ID = illegal_funct3_func | illegal_funct3_csr;
 
-// ---- ID_EX_reg outputs → EX_stage / EX_MEM_reg ----
+// ---- ID_EX_reg outputs -> EX_stage / EX_MEM_reg ----
 wire [31:0] PC_EX, PCPlus4_EX, RD1_EX, RD2_EX, ImmExt_EX, Instr_EX;
 wire [4:0] WA_EX;
 wire [3:0] ALUControl_EX;
@@ -49,11 +54,11 @@ wire [1:0] Width_EX, ResultSrc_EX;
 wire RegWrite_EX, ALUSrc_EX, MemWrite_EX, Branch_EX, Jump_EX, Predicted_Taken_EX, IsCSR_EX;
 wire Mret_EX;   // an mret is currently sitting in EX (carried through ID_EX_reg)
 
-// ---- EX_stage outputs → EX_MEM_reg (+ feedback to IF_stage) ----
+// ---- EX_stage outputs -> EX_MEM_reg (+ feedback to IF_stage) ----
 wire [31:0] Result_EX, PCTarget_EX, EX_RedirectPC_EX;
 wire IsJalr_EX, EX_Override_EX, Actual_Taken_EX;
 
-// ---- EX_MEM_reg outputs → MEM_stage / MEM_WB_reg ----
+// ---- EX_MEM_reg outputs -> MEM_stage / MEM_WB_reg ----
 wire [31:0] PCPlus4_MEM, ALUResult_MEM, RD2_MEM, csr_read_val_MEM;
 wire [4:0] WA_MEM;
 wire [2:0] Funct3_MEM;
@@ -62,14 +67,14 @@ wire RegWrite_MEM, MemWrite_MEM, IsLoad_MEM;
 
 // ---- (no MEM_stage module any more: the data memory is an AHB slave outside the CPU) ----
 
-// ---- MEM_WB_reg outputs → result_mux / id_stage feedback ----
+// ---- MEM_WB_reg outputs -> result_mux / id_stage feedback ----
 wire [31:0] PCPlus4_WB, ALUResult_WB, ReadData_WB, csr_read_val_WB, RD2_WB;   // ReadData_WB = load_extend output (HRDATA extended)
 wire [4:0] WA_WB;
 wire [1:0] ResultSrc_WB;
 wire RegWrite_WB, IsLoad_WB, MemWrite_WB;
 wire [2:0] Funct3_WB;
 
-// ---- result_mux output → id_stage write-back (also doubles as MEM/WB forwarding candidate) ----
+// ---- result_mux output -> id_stage write-back (also doubles as MEM/WB forwarding candidate) ----
 wire [31:0] Result_WB;
 
 // ---- raw-field slice needed before ID_EX_reg ----
@@ -108,7 +113,7 @@ wire priority_ok = (interrupt_ID != 2'b00) && (interrupt_ID > current_priority_v
 
 // Bus error: the slave's ERROR response is in its last cycle (HRESP = 1 and HREADY = 1, state ERR2).
 // The faulting load/store is in WB. Highest priority trap (it is older than anything in EX / ID).
-wire bus_error = HRESP & HREADY;
+wire bus_error = HRESP & HREADY & dp_data;   // only an ERROR on a load/store is a trap here; a fetch error becomes a fault flag in IF
 
 // A load/store is in MEM: its address phase is on the bus now, and its data phase (and a possible ERROR) comes next cycle.
 wire mem_transfer_MEM = IsLoad_MEM | MemWrite_MEM;
@@ -313,7 +318,7 @@ wire [31:0] mtvec_for_trap = mtvec_write_en ? {csr_wdata[31:2], 1'b0, csr_wdata[
 
 // ============ INSTANTIATIONS ============
 
-IF_stage IF_stage_inst
+IF_stage #(.BASE(IMEM_BASE)) IF_stage_inst
 (
     .clk(clk),
     .reset(reset),
@@ -330,7 +335,13 @@ IF_stage IF_stage_inst
     .PCPlus4(PCPlus4_IF),
     .Instr(Instr_IF),
     .Predicted_Taken(Predicted_Taken_IF),
-    .instruction_access_fault(instruction_access_fault_IF)
+    .instruction_access_fault(instruction_access_fault_IF),
+    .Valid(Valid_IF),
+    .HRDATA_fetch(HRDATA),
+    .fetch_grant(fetch_grant),
+    .fetch_err(HRESP & dp_fetch),
+    .HADDR_fetch(HADDR_fetch),
+    .fetch_req(fetch_req)
 );
 
 IF_ID_reg IF_ID_reg_inst
@@ -344,6 +355,7 @@ IF_ID_reg IF_ID_reg_inst
     .exception_taken(exception_taken),
     .pipe_ready(pipe_ready),
     .Predicted_Taken_In(Predicted_Taken_IF),
+    .Valid_In(Valid_IF),
     .Instr_In(Instr_IF),
     .PC_In(PC_IF),
     .PC_Plus_4_In(PCPlus4_IF),
@@ -541,9 +553,12 @@ EX_MEM_reg EX_MEM_reg_inst
 
 // Address phase of the bus transfer: driven from the MEM-stage registers.
 // The data phase (HWDATA / HRDATA) happens one cycle later, while the instruction is in WB.
-// HRESP / HREADY: in the last cycle of an ERROR response the master drives HTRANS = IDLE (cancels the next transfer).
+// This module is also the arbiter: a load/store in MEM wins the bus, otherwise the fetch address goes out.
+// In the last cycle of a load/store ERROR response the master drives HTRANS = IDLE (cancels the next transfer).
 AHB_master_CPU_interface AHB_master_CPU_interface_inst
 (
+    .clk(clk),
+    .reset(reset),
     .IsLoad_MEM(IsLoad_MEM),
     .MemWrite_MEM(MemWrite_MEM),
     .HRESP(HRESP),
@@ -551,11 +566,16 @@ AHB_master_CPU_interface AHB_master_CPU_interface_inst
     .Width_MEM(Width_MEM),
     .ALUResult_MEM(ALUResult_MEM),
     .RD2_WB(RD2_WB),
+    .fetch_req(fetch_req),
+    .HADDR_fetch(HADDR_fetch),
     .HWRITE(HWRITE),
     .HTRANS(HTRANS),
     .HSIZE(HSIZE),
     .HADDR(HADDR),
-    .HWDATA(HWDATA)
+    .HWDATA(HWDATA),
+    .fetch_grant(fetch_grant),
+    .dp_data(dp_data),
+    .dp_fetch(dp_fetch)
 );
 
 MEM_WB_reg MEM_WB_reg_inst

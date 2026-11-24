@@ -1,6 +1,7 @@
 module IF_ID_reg
 (
     input clk, reset, Flush, Stall, Predicted_Taken_In, Mret_taken, interrupt_taken, exception_taken, instruction_access_fault_In, pipe_ready,
+    input Valid_In,     // 1 = a real instruction is arriving, 0 = no instruction this cycle (bubble)
     input [31:0] Instr_In, PC_In, PC_Plus_4_In,
     output reg [31:0] Instr_Out, PC_Out, PC_Plus_4_Out,
     output reg Predicted_Taken_Out, instruction_access_fault_Out, Valid_Out
@@ -51,12 +52,12 @@ end
 
 else
 begin
-Instr_Out <= Instr_In;
+Instr_Out <= Instr_In;                 // IF_stage already gives a nop / zero PC when Valid_In = 0
 PC_Out <= PC_In;
 PC_Plus_4_Out <= PC_Plus_4_In;
 Predicted_Taken_Out <= Predicted_Taken_In;
 instruction_access_fault_Out <= instruction_access_fault_In;
-Valid_Out <= 1'b1;
+Valid_Out <= Valid_In;
 end
 
 end

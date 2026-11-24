@@ -14,3 +14,6 @@ waves.*
 *.wcfg
 c_build/
 c_run/
+
+#Local notes
+rtl_changes.txt

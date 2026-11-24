@@ -1,8 +1,8 @@
-module top
+module top #(parameter [31:0] IMEM_BASE = 32'h0)
 (
   input clk, reset, interrupt_keyboard, interrupt_disk,
 
-  // ---- AHB-Lite master side (data bus) ----
+  // ---- AHB-Lite master side (ONE shared bus: load/store and instruction fetch) ----
   input         HREADY,
   input         HRESP,
   input  [31:0] HRDATA,
@@ -10,13 +10,13 @@ module top
   output [1:0]  HTRANS,
   output [2:0]  HSIZE,
   output [31:0] HADDR,
-  output [31:0] HWDATA,
-
-  // ---- AHB-Lite master side (instruction bus, fetch only) ----
-  input  [31:0] IHRDATA,
-  output [1:0]  IHTRANS,
-  output [31:0] IHADDR
+  output [31:0] HWDATA
 );
+
+// ---- shared bus: arbiter (AHB_master_CPU_interface) <-> IF_stage ----
+wire fetch_req, fetch_grant;       // IF wants the bus / the fetch address is on the bus
+wire [31:0] HADDR_fetch;
+wire dp_data, dp_fetch;            // the transfer in its data phase is a load/store / a fetch
 
 // ---- IF stage outputs -> IF_ID_reg ----
 wire [31:0] PC_IF, PCPlus4_IF, Instr_IF;
@@ -113,7 +113,7 @@ wire priority_ok = (interrupt_ID != 2'b00) && (interrupt_ID > current_priority_v
 
 // Bus error: the slave's ERROR response is in its last cycle (HRESP = 1 and HREADY = 1, state ERR2).
 // The faulting load/store is in WB. Highest priority trap (it is older than anything in EX / ID).
-wire bus_error = HRESP & HREADY;
+wire bus_error = HRESP & HREADY & dp_data;   // only an ERROR on a load/store is a trap here; a fetch error becomes a fault flag in IF
 
 // A load/store is in MEM: its address phase is on the bus now, and its data phase (and a possible ERROR) comes next cycle.
 wire mem_transfer_MEM = IsLoad_MEM | MemWrite_MEM;
@@ -318,7 +318,7 @@ wire [31:0] mtvec_for_trap = mtvec_write_en ? {csr_wdata[31:2], 1'b0, csr_wdata[
 
 // ============ INSTANTIATIONS ============
 
-IF_stage IF_stage_inst
+IF_stage #(.BASE(IMEM_BASE)) IF_stage_inst
 (
     .clk(clk),
     .reset(reset),
@@ -337,9 +337,11 @@ IF_stage IF_stage_inst
     .Predicted_Taken(Predicted_Taken_IF),
     .instruction_access_fault(instruction_access_fault_IF),
     .Valid(Valid_IF),
-    .HRDATA_fetch(IHRDATA),
-    .HADDR_fetch(IHADDR),
-    .HTRANS_fetch(IHTRANS)
+    .HRDATA_fetch(HRDATA),
+    .fetch_grant(fetch_grant),
+    .fetch_err(HRESP & dp_fetch),
+    .HADDR_fetch(HADDR_fetch),
+    .fetch_req(fetch_req)
 );
 
 IF_ID_reg IF_ID_reg_inst
@@ -551,9 +553,12 @@ EX_MEM_reg EX_MEM_reg_inst
 
 // Address phase of the bus transfer: driven from the MEM-stage registers.
 // The data phase (HWDATA / HRDATA) happens one cycle later, while the instruction is in WB.
-// HRESP / HREADY: in the last cycle of an ERROR response the master drives HTRANS = IDLE (cancels the next transfer).
+// This module is also the arbiter: a load/store in MEM wins the bus, otherwise the fetch address goes out.
+// In the last cycle of a load/store ERROR response the master drives HTRANS = IDLE (cancels the next transfer).
 AHB_master_CPU_interface AHB_master_CPU_interface_inst
 (
+    .clk(clk),
+    .reset(reset),
     .IsLoad_MEM(IsLoad_MEM),
     .MemWrite_MEM(MemWrite_MEM),
     .HRESP(HRESP),
@@ -561,11 +566,16 @@ AHB_master_CPU_interface AHB_master_CPU_interface_inst
     .Width_MEM(Width_MEM),
     .ALUResult_MEM(ALUResult_MEM),
     .RD2_WB(RD2_WB),
+    .fetch_req(fetch_req),
+    .HADDR_fetch(HADDR_fetch),
     .HWRITE(HWRITE),
     .HTRANS(HTRANS),
     .HSIZE(HSIZE),
     .HADDR(HADDR),
-    .HWDATA(HWDATA)
+    .HWDATA(HWDATA),
+    .fetch_grant(fetch_grant),
+    .dp_data(dp_data),
+    .dp_fetch(dp_fetch)
 );
 
 MEM_WB_reg MEM_WB_reg_inst

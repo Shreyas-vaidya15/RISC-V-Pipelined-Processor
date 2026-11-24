@@ -1,4 +1,5 @@
-module AHB_inst_memory #(parameter DEPTH = 256)   // DEPTH in words, passed to inst_memory
+module AHB_inst_memory #(parameter DEPTH = 256,            // DEPTH in words, passed to inst_memory
+                         parameter [31:0] BASE = 32'h0)    // address of this slave on the bus; the memory sees HADDR - BASE
 (
     input HCLK,
     input HRESETn,
@@ -23,7 +24,8 @@ reg [31:0] addr_dp;      // address saved from the address phase, used in the da
 
 // ---------------- trigger ----------------
 wire accepted     = HSEL && HTRANS[1] && HREADY;
-wire out_of_range = (HADDR >= DEPTH * 4);
+wire [31:0] offset = HADDR - BASE;                  // address inside this slave
+wire out_of_range = (offset >= DEPTH * 4);
 wire bad_transfer = accepted && (HWRITE || out_of_range);   // any write, or an address past the memory
 
 // ---------------- saved address ----------------
@@ -36,7 +38,7 @@ begin
 
     else if(HREADY)
     begin
-        addr_dp <= HADDR;
+        addr_dp <= offset;
     end
 end
 
@@ -65,7 +67,8 @@ begin
 
     S_ERR1: next_state = S_ERR2;
 
-    S_ERR2: next_state = S_OKAY;
+    // the master does not cancel the next address after a fetch error, so a new bad transfer can already be accepted here
+    S_ERR2: next_state = bad_transfer ? S_ERR1 : S_OKAY;
 
     default: next_state = S_OKAY;
 

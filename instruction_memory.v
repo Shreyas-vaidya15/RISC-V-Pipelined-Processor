@@ -1,26 +1,28 @@
 module inst_memory #(parameter DEPTH = 256) (input [31:0] addr, output [31:0] data);
 
 // ============================================================================================
-// INTERRUPT SWEEP IMAGE, stage 4: with bus errors  (pairs with tb_sweep in tb.v)
+// INTERRUPT SWEEP IMAGE, stage 5: ONE shared AHB bus for fetch and data  (pairs with tb_sweep in tb.v)
 //
 // One deterministic program, run many times by the testbench. Each run delivers ONE interrupt pulse
 // (keyboard, disk or both) at a different cycle, and the final registers / data memory / CSRs are compared
 // with a run that had no interrupt.
 //
-// The program now takes bus errors on purpose (section S8): loads and stores to addresses outside data memory.
+// Memory map: instruction memory at 0x0000_0000, data memory at 0x1000_0000 (x30 holds the base from S2 on), everything else is the
+// default slave, which answers every transfer with ERROR. The program takes bus errors on purpose (S8, S10): loads and stores to
+// addresses outside data memory, to an unmapped address and into the read-only instruction memory, and fetch faults (S10).
 // The exception handler is transparent: it counts the exception in x24, skips the faulting instruction
 // (mepc += 4) and uses x26 as scratch (cleared again before mret).
 // The interrupt handler is transparent too: it only touches x23.
-// Every run must take the same number of exceptions as the reference run (exp_exc = 14: 11 bus errors + 3 EX exceptions in S9).
+// Every run must take the same number of exceptions as the reference run (exp_exc = 23: 15 bus errors + 3 EX exceptions in S9 + 5 fetch faults in S10).
 //
 // The program never reads a CSR whose value a trap would change (mstatus, mcause, mtval, priorities).
 // It uses mscratch, misa, mie, and mstatus only in windows where MIE = 0.
 //
 // Fixed layout:  0 jal x0,MAIN | 100 jal x0,EXC_H | 144 jal x0,IRQ_H (mtvec reset 0x65, cause 11 -> base+44)
-//                160 IRQ_H: x23++ ; mret        192 EXC_H: x24++ ; mepc += 4 ; mret   (runs once per bus error)
+//                160 IRQ_H: x23++ ; mret        192 EXC_H: x24++ ; load/store fault: mepc += 4 ; mret,  fetch fault: mepc = mscratch ; mret
 //                512.. main program
 //
-// Reserved registers: x23 interrupt counter, x24 exception counter, x30 end marker (99),
+// Reserved registers: x23 interrupt counter, x24 exception counter, x30 data base 0x1000_0000 (from S2 on; the end marker 99 at the very end),
 //                     x26 stays 0 (written only by skipped instructions and by the exception handler, which clears it)
 //
 // What the program covers (an interrupt can land on any of these):
@@ -32,6 +34,9 @@ module inst_memory #(parameter DEPTH = 256) (input [31:0] addr, output [31:0] da
 //   S5  mscratch csrrw/csrrs/csrrc/csrrsi with the result used at once, misa read
 //   S6  mstatus.MIE = 0 window, then "csrrw mepc ; mret" back to back (a software mret jump)
 //   S7  CSR / load-pointer / mret cases right behind a memory op (wait states)
+//   S10 one shared bus: back-to-back load/stores, branch / jal / jalr right behind a load, a load from the instruction memory window,
+//       bus errors from the default slave and from the read-only instruction slave, fetch faults (bus ERROR on a fetch and the PC range
+//       check), a fetch fault right behind a load / store, a bad store with a faulty fetch right behind it. (placed in the file before S8)
 //   S8  bus errors: bad load, bad store, good access right behind a bad one, back-to-back bad accesses,
 //       a bad access inside a loop, a bad load right before a mispredicted branch and before a jal
 //   S9  operand capture during the older-transfer hold: an EX exception (misaligned load / store / branch target) sits
@@ -60,7 +65,8 @@ reg [8*24-1:0] gold_rname [0:63];
 integer        gold_addr  [0:63];
 reg [31:0]     gold_mval  [0:63];
 
-integer L_main, L_irq, L_exc;
+integer L_main, L_irq, L_exc, L_exc_n;
+integer L_d1, L_d2, L_f1, L_f1b, L_f1c, L_f2, L_f3;
 integer L_l1, L_l2, L_l3, L_l4, L_b1, L_b2, L_b3, L_b4, L_b5, L_b6, L_b8, L_j8, L_fn, L_after, L_mret_t, L_mret_t2;
 
 // ---- instruction encoders (arguments in assembly order) ----
@@ -140,8 +146,8 @@ endtask
 task build;
 begin
     n_greg = 0; n_gmem = 0;
-    exp_bus_err = 11;                 // S8: 1 + 1 + 3 + 4 + 2 bus errors
-    exp_exc = 14;                     // + S9: misaligned load, misaligned store, taken branch with a misaligned target
+    exp_bus_err = 15;                 // S8: 1 + 1 + 3 + 4 + 2 = 11, S10: 3 (d) + 1 (e3) = 4
+    exp_exc = 23;                     // 15 bus errors + S9: 3 EX exceptions + S10: 5 fetch faults (e1, e1b, e1c, e2, e3)
     exp_hold = 3;                     // S9: one ex_hold per case
     L_main = 512; L_irq = 160; L_exc = 192;
 
@@ -158,8 +164,19 @@ begin
     // ---- exception handler: transparent for bus errors. x24 counts them, the faulting load/store is skipped. ----
     // x26 is the scratch register; it is cleared again so the "skipped instructions never ran" check still works.
     // MIE = 0 in here, so no interrupt can overwrite mepc between the csrrs and the csrrw.
+    // Two paths, told apart by mepc: a faulting load/store lies inside the 4 KB program (mepc >> 12 = 0): skip it (mepc += 4).
+    // A faulting FETCH (section S10: a jump to 0x1000 / 0x2000) has mepc >> 12 != 0: resume at the address kept in mscratch.
     pc = 192;
     emit(ADDI(24, 24, 1));
+    emit(CSRRS(26, CSR_MEPC, 0));        // x26 = PC of the faulting instruction
+    emit(SRLI(26, 26, 12));              // 0 = inside the program, else a fetch outside it
+    emit(BRL(3'b000, 26, 0, L_exc_n));   // beq x26, x0: load/store path
+    emit(CSRRS(26, CSR_MSCRATCH, 0));    // fetch fault: x26 = resume address
+    emit(CSRRW(0, CSR_MEPC, 26));
+    emit(ADDI(26, 0, 0));                // x26 = 0 again
+    emit(NOP);
+    emit(MRET);
+    L_exc_n = pc;
     emit(CSRRS(26, CSR_MEPC, 0));        // x26 = PC of the faulting load/store
     emit(ADDI(26, 26, 4));
     emit(CSRRW(0, CSR_MEPC, 26));        // mepc = the next instruction
@@ -201,7 +218,8 @@ begin
     gr(15, 32'd0, "x15 sltu");
 
     // ---------- S2: memory, every width, store->load, load-use ----------
-    emit(ADDI(16, 0, 64));
+    emit(LUI(30, 20'h10000));             // x30 = 0x1000_0000: data memory base, used by every data access (x30 is free until the end marker)
+    emit(ADDI(16, 30, 64));
     emit(SW(10, 0, 16));              // mem[64..67] = 0x1234567C
     emit(LW(17, 0, 16));
     emit(ADD(18, 17, 17));            // load-use: 0x2468ACF8
@@ -216,7 +234,7 @@ begin
     emit(SH(12, 12, 16));             // mem[76..77] = 0xFF9C
     emit(LH(31, 12, 16));             // 0xFFFFFF9C
     emit(ADD(20, 27, 31));            // load-use on x31: 0xFFFFFF38
-    emit(SW(20, 240, 0));
+    emit(SW(20, 240, 30));
     gr(17, 32'h1234567C, "x17 lw");
     gr(18, 32'h2468ACF8, "x18 load-use add");
     gr(19, 32'h13, "x19 lbu");
@@ -231,24 +249,24 @@ begin
     emit(ADD(28, 28, 29));
     emit(ADDI(29, 29, -1));
     emit(BRL(3'b001, 29, 0, L_l1));   // bne, backward: predicted taken, exit is a mispredict
-    emit(SW(28, 200, 0));             // 55
+    emit(SW(28, 200, 30));             // 55
     gm(200, 32'd55);
 
-    emit(ADDI(27, 0, 128)); emit(ADDI(20, 0, 8)); emit(ADDI(29, 0, 1));
+    emit(ADDI(27, 30, 128)); emit(ADDI(20, 0, 8)); emit(ADDI(29, 0, 1));
     L_l2 = pc;
     emit(SW(29, 0, 27));
     emit(ADDI(29, 29, 3));
     emit(ADDI(27, 27, 4));
     emit(ADDI(20, 20, -1));
     emit(BRL(3'b001, 20, 0, L_l2));   // array 1,4,7,...,22
-    emit(ADDI(27, 0, 128)); emit(ADDI(20, 0, 8)); emit(ADDI(31, 0, 0));
+    emit(ADDI(27, 30, 128)); emit(ADDI(20, 0, 8)); emit(ADDI(31, 0, 0));
     L_l3 = pc;
     emit(LW(29, 0, 27));
     emit(ADD(31, 31, 29));            // load-use inside a loop
     emit(ADDI(27, 27, 4));
     emit(ADDI(20, 20, -1));
     emit(BRL(3'b001, 20, 0, L_l3));
-    emit(SW(31, 204, 0));             // 92
+    emit(SW(31, 204, 30));             // 92
     gm(204, 32'd92);
 
     // ---------- S3b: every branch type ----------
@@ -276,7 +294,7 @@ begin
     emit(ADDI(28, 28, 8));
     emit(BRL(3'b001, 29, 29, L_b6));  // bne x29,x29 backward: predicted taken, never taken
     emit(ADDI(28, 28, 16));
-    emit(SW(28, 208, 0));             // 1+2+4+8+16 = 31
+    emit(SW(28, 208, 30));             // 1+2+4+8+16 = 31
     gm(208, 32'd31);
 
     // ---------- S4: jal / jalr ----------
@@ -288,7 +306,7 @@ begin
     emit(ADDI(29, 29, 10));
     emit(JALR(0, 20, 0));             // return
     L_after = pc;
-    emit(SW(29, 212, 0));             // 20
+    emit(SW(29, 212, 30));             // 20
     gm(212, 32'd20);
 
     emit(AUIPC(27, 0));               // jalr to a computed address: pc + 16
@@ -296,7 +314,7 @@ begin
     emit(JALR(0, 27, 0));
     emit(ADDI(26, 0, 12'hBAD));       // skipped
     emit(ADDI(28, 0, 77));
-    emit(SW(28, 244, 0));
+    emit(SW(28, 244, 30));
     gm(244, 32'd77);
 
     // ---------- S5: mscratch / misa, CSR result used straight away ----------
@@ -309,7 +327,7 @@ begin
     emit(CSRRC(29, CSR_MSCRATCH, 28));      // x29 = 0x2AD, mscratch = 0x2A0
     emit(CSRRS(20, CSR_MSCRATCH, 0));       // 0x2A0
     emit(CSRRS(28, CSR_MISA, 0));           // 0x40000100
-    emit(SW(31, 216, 0)); emit(SW(27, 220, 0)); emit(SW(29, 224, 0)); emit(SW(20, 228, 0)); emit(SW(28, 232, 0));
+    emit(SW(31, 216, 30)); emit(SW(27, 220, 30)); emit(SW(29, 224, 30)); emit(SW(20, 228, 30)); emit(SW(28, 232, 30));
     gm(216, 32'h54A); gm(220, 32'h2A5); gm(224, 32'h2AD); gm(228, 32'h2A0); gm(232, 32'h40000100);
 
     // ---------- S6: MIE = 0 window, then csrrw mepc ; mret back to back ----------
@@ -323,7 +341,7 @@ begin
     emit(ADDI(26, 0, 12'hBAD));       // skipped
     L_mret_t = pc;
     emit(ADDI(28, 0, 1));
-    emit(SW(28, 236, 0));
+    emit(SW(28, 236, 30));
     gm(236, 32'd1);
 
     // ---------- S7: CSR / load-pointer / mret cases placed right behind a memory op ----------
@@ -334,10 +352,10 @@ begin
 
     // A: csrrw two places behind a store. rd must get the OLD mscratch, not the value written by this same csrrw.
     emit(ADDI(1, 0, 12'h111));
-    emit(SW(1, 248, 0));                    // the memory op that may wait
+    emit(SW(1, 248, 30));                    // the memory op that may wait
     emit(NOP);
     emit(CSRRW(20, CSR_MSCRATCH, 1));       // x20 = 0x2A0, mscratch = 0x111
-    emit(SW(20, 252, 0));
+    emit(SW(20, 252, 30));
     gm(248, 32'h111); gm(252, 32'h2A0);
 
     // B: csrrs (read-modify-write) two places behind a load. rd must get the OLD mscratch.
@@ -345,59 +363,149 @@ begin
     emit(LW(27, 0, 16));                    // the memory op that may wait
     emit(NOP);
     emit(CSRRS(28, CSR_MSCRATCH, 6));       // x28 = 0x111, mscratch = 0x11F
-    emit(SW(28, 160, 0));
+    emit(SW(28, 160, 30));
     gm(160, 32'h111);
 
     // C: a loaded pointer used as the address of the very next load. While the first load waits, its data is not valid yet:
     // the second load (in EX) must not trap or use it until the wait is over.
-    emit(ADDI(8, 0, 168));
+    emit(ADDI(8, 30, 168));                 // x8 = 0x1000_00A8: a pointer is a full address now
     emit(ADDI(9, 0, 12'h5A5));
-    emit(SW(8, 164, 0));                    // mem[164] = 168 (a pointer)
-    emit(SW(9, 168, 0));                    // mem[168] = 0x5A5
-    emit(LW(29, 164, 0));                   // x29 = 168, may wait
+    emit(SW(8, 164, 30));                    // mem[164] = 168 (a pointer)
+    emit(SW(9, 168, 30));                    // mem[168] = 0x5A5
+    emit(LW(29, 164, 30));                   // x29 = 168, may wait
     emit(LW(31, 0, 29));                    // address comes from the load above
-    emit(SW(31, 172, 0));
-    gm(164, 32'd168); gm(168, 32'h5A5); gm(172, 32'h5A5);
+    emit(SW(31, 172, 30));
+    gm(164, 32'h100000A8); gm(168, 32'h5A5); gm(172, 32'h5A5);
 
     // D: csrrw mepc ; mret right behind a store that may wait. The mret must update MIE / MPIE only ONCE.
     // Start with MIE = 0, MPIE = 0: one mret gives MIE = 0, MPIE = 1 (mstatus reads 0x1880). A second mret would give MIE = 1.
     // MIE stays 0 up to the read, so no interrupt can change what is read. Then MIE is turned on again.
     LI(12, L_mret_t2);
     emit(CSRRW(0, CSR_MSTATUS, 0));         // MIE = 0, MPIE = 0
-    emit(SW(9, 176, 0));                    // the memory op that may wait
+    emit(SW(9, 176, 30));                    // the memory op that may wait
     emit(NOP);
     emit(CSRRW(0, CSR_MEPC, 12));
     emit(MRET);
     emit(ADDI(26, 0, 12'hBAD));             // skipped
     L_mret_t2 = pc;
     emit(CSRRS(20, CSR_MSTATUS, 0));        // read only: 0x1880
-    emit(SW(20, 180, 0));
+    emit(SW(20, 180, 30));
     emit(CSRRSI(0, CSR_MSTATUS, 5'd8));     // MIE = 1 again (MPIE is already 1)
     gm(176, 32'h5A5); gm(180, 32'h1880);
 
+    // ---------- S10: ONE shared bus for fetch and data, memory map: instruction memory 0x0, data memory 0x1000_0000, rest = default slave ----------
+    // The CPU is the only master. A load/store in MEM wins the bus, the fetch waits. A fetch is presented only when HREADY = 1.
+    // Placed before S8, so it may use x1 x2 x4 x6 x8 x9 x12 x20 x27 x28 x29 x31 freely (S8 / S9 set them again before use). x30 = data base.
+    // Data memory bytes used here: 44..63, 80..95, 120..127 (all free). Every result is stored and checked by a golden value.
+
+    // a: 6 stores, then 6 loads, back to back. The fetch gets the bus only in the gaps.
+    emit(ADDI(4, 0, 12'h011)); emit(ADDI(6, 0, 12'h022)); emit(ADDI(8, 0, 12'h033)); emit(ADDI(9, 0, 12'h044));
+    emit(SW(4, 44, 30)); emit(SW(6, 48, 30)); emit(SW(8, 52, 30)); emit(SW(9, 56, 30)); emit(SW(4, 60, 30)); emit(SW(6, 80, 30));
+    emit(LW(12, 44, 30)); emit(LW(20, 48, 30)); emit(LW(27, 52, 30)); emit(LW(28, 56, 30)); emit(LW(29, 60, 30)); emit(LW(31, 80, 30));
+    emit(ADD(12, 12, 20)); emit(ADD(12, 12, 27)); emit(ADD(12, 12, 28)); emit(ADD(12, 12, 29)); emit(ADD(12, 12, 31));
+    emit(SW(12, 84, 30));                   // 0x11 + 0x22 + 0x33 + 0x44 + 0x11 + 0x22 = 0xDD
+    gm(44, 32'h11); gm(48, 32'h22); gm(52, 32'h33); gm(56, 32'h44); gm(60, 32'h11); gm(80, 32'h22); gm(84, 32'hDD);
+
+    // b: a taken branch, a jal and a jalr, each right behind a load. The load holds the bus while the fetch of the target is waiting.
+    emit(ADDI(4, 0, 0));
+    emit(LW(6, 44, 30));
+    emit(BRL(3'b000, 0, 0, L_d1));          // beq x0,x0: taken, forward = mispredicted
+    emit(ADDI(4, 4, 100));                  // skipped
+    L_d1 = pc;
+    emit(ADDI(4, 4, 1));
+    emit(LW(8, 48, 30));
+    emit(JAL(0, L_d2));                     // jal right behind a load
+    emit(ADDI(4, 4, 200));                  // skipped
+    L_d2 = pc;
+    emit(ADDI(4, 4, 2));
+    emit(AUIPC(27, 0));                     // jalr to a computed address: the instruction after the skipped one
+    emit(ADDI(27, 27, 20));
+    emit(LW(6, 44, 30));
+    emit(JALR(0, 27, 0));                   // jalr right behind a load
+    emit(ADDI(4, 4, 300));                  // skipped
+    emit(ADDI(4, 4, 4));                    // x4 = 1 + 2 + 4 = 7
+    emit(SW(4, 88, 30));
+    gm(88, 32'd7);
+
+    // c: a load from the INSTRUCTION memory window (address 0 is a legal read): the data phase comes from the instruction slave
+    emit(LW(9, 0, 0));                      // x9 = the word at address 0 = jal x0, MAIN
+    emit(SW(9, 92, 30));
+    gm(92, JALO(0, L_main));
+
+    // d: bus errors from the DEFAULT slave (nobody owns 0x2000_0000) and from the read-only instruction slave (a write to 0x0): 3 bus errors
+    emit(LUI(1, 20'h20000));                // x1 = 0x2000_0000
+    emit(ADDI(28, 0, 12'h05A));
+    emit(LW(28, 0, 1));                     // BAD load (default slave): x28 keeps 0x5A
+    emit(SW(28, 0, 1));                     // BAD store (default slave)
+    emit(SW(28, 0, 0));                     // BAD store to the instruction memory (read-only slave)
+    emit(SW(28, 120, 30));
+    gm(120, 32'h5A);
+
+    // e: a FETCH error is not a trap on the bus: it travels with the instruction as an instruction access fault (cause 1).
+    // The jump goes to 0x1000 (past the 4 KB instruction memory, inside the fetch range check of the testbench): the fetch goes out on
+    // the bus, the default slave answers ERROR. 0x2000 is caught by the range check in IF and never reaches the bus.
+    // The exception handler resumes at the address kept in mscratch. Every case adds its own bit to x29, so a missed or a repeated resume shows.
+    emit(ADDI(29, 0, 0));
+    // e1: the jal is right behind a good load: the load wins the bus, the fetch of the target waits, then comes back with an ERROR
+    LI(31, L_f1);  emit(CSRRW(0, CSR_MSCRATCH, 31));
+    emit(LW(6, 44, 30));
+    emit(JAL(0, 32'h1000));
+    L_f1 = pc;
+    emit(ADDI(29, 29, 1));
+    // e1b: one nop between the load and the jal
+    LI(31, L_f1b); emit(CSRRW(0, CSR_MSCRATCH, 31));
+    emit(LW(6, 48, 30));
+    emit(NOP);
+    emit(JAL(0, 32'h1000));
+    L_f1b = pc;
+    emit(ADDI(29, 29, 2));
+    // e1c: a store and two nops between
+    LI(31, L_f1c); emit(CSRRW(0, CSR_MSCRATCH, 31));
+    emit(SW(29, 124, 30));
+    emit(NOP);
+    emit(NOP);
+    emit(JAL(0, 32'h1000));
+    L_f1c = pc;
+    emit(ADDI(29, 29, 4));
+    // e2: out of the fetch range (0x2000): the fault comes from the range check, no bus transfer. A store right before it.
+    LI(31, L_f2); emit(CSRRW(0, CSR_MSCRATCH, 31));
+    emit(SW(29, 124, 30));
+    emit(JAL(0, 32'h2000));
+    L_f2 = pc;
+    emit(ADDI(29, 29, 8));
+    // e3: a BAD store (bus error, default slave) with the jal right behind it: the bus error comes back while the fetch of the faulty
+    // target is on its way. The bus error is older and wins; the handler skips the store, the jal runs, and then the fetch fault is taken.
+    LI(31, L_f3); emit(CSRRW(0, CSR_MSCRATCH, 31));
+    emit(SW(28, 0, 1));                     // BAD store: x1 is still 0x2000_0000
+    emit(JAL(0, 32'h1000));
+    L_f3 = pc;
+    emit(ADDI(29, 29, 16));
+    emit(SW(29, 124, 30));                  // 1 + 2 + 4 + 8 + 16 = 31
+    gm(124, 32'd31);
+
     // ---------- S8: bus errors ----------
-    // Data memory is 256 bytes, so x1 = 256 is the first bad address. A bad load leaves rd unchanged (the handler skips it),
+    // Data memory is 256 bytes, so x1 = 0x1000_0100 (data base + 256) is the first bad address. A bad load leaves rd unchanged (the handler skips it),
     // a bad store writes nothing. Every case is stored at once and checked by a golden value.
     // Free registers here: x1 x2 x4 x6 x8 x9 x12 x20 x27 x28 x29 x31. Data memory words 0..40 are free.
-    emit(SW(26, 0, 0));                     // x26 must still be 0: mem[0] = 0 (no exception has run yet)
+    emit(SW(26, 0, 30));                     // x26 must still be 0: mem[0] = 0 (the handler clears x26 again before every mret)
     gm(0, 32'd0);
-    emit(ADDI(1, 0, 12'd256));              // x1 = 256, the bad base address
+    emit(ADDI(1, 30, 12'd256));             // x1 = 0x1000_0100, the bad base address (first word past data memory)
     emit(ADDI(2, 0, 12'h066));
-    emit(SW(2, 8, 0));                      // mem[8] = 0x66 (good store)
+    emit(SW(2, 8, 30));                      // mem[8] = 0x66 (good store)
     gm(8, 32'h66);
 
     // a: bad load, then a good load right behind it, then stores that use both results (1 bus error)
     emit(ADDI(4, 0, 12'h077));
     emit(LW(4, 0, 1));                      // BAD load: x4 keeps 0x77
-    emit(LW(8, 8, 0));                      // good load right behind: x8 = 0x66 (squashed once, then re-run)
-    emit(SW(4, 4, 0));                      // mem[4] = 0x77
-    emit(SW(8, 12, 0));                     // mem[12] = 0x66 (load-use on x8)
+    emit(LW(8, 8, 30));                      // good load right behind: x8 = 0x66 (squashed once, then re-run)
+    emit(SW(4, 4, 30));                      // mem[4] = 0x77
+    emit(SW(8, 12, 30));                     // mem[12] = 0x66 (load-use on x8)
     gm(4, 32'h77); gm(12, 32'h66);
 
     // b: bad store, then a good store right behind it (1 bus error)
     emit(ADDI(6, 0, 12'h055));
     emit(SW(6, 0, 1));                      // BAD store to 256: nothing written
-    emit(SW(6, 16, 0));                     // good store right behind: mem[16] = 0x55
+    emit(SW(6, 16, 30));                     // good store right behind: mem[16] = 0x55
     gm(16, 32'h55);
 
     // c: bad load, bad load, bad store back to back (3 bus errors)
@@ -406,8 +514,8 @@ begin
     emit(LW(9, 0, 1));                      // BAD: x9 keeps 0x99
     emit(LW(12, 4, 1));                     // BAD (260): x12 keeps 0x1C
     emit(SW(6, 8, 1));                      // BAD store (264)
-    emit(SW(9, 20, 0));                     // mem[20] = 0x99
-    emit(SW(12, 24, 0));                    // mem[24] = 0x1C
+    emit(SW(9, 20, 30));                     // mem[20] = 0x99
+    emit(SW(12, 24, 30));                    // mem[24] = 0x1C
     gm(20, 32'h99); gm(24, 32'h1C);
 
     // d: a bad load inside a loop, 4 passes (4 bus errors). x31 keeps 0x31, the loop sum is 12.
@@ -419,8 +527,8 @@ begin
     emit(ADDI(28, 28, 3));
     emit(ADDI(29, 29, -1));
     emit(BRL(3'b001, 29, 0, L_l4));         // bne, backward: predicted taken, exit is a mispredict
-    emit(SW(28, 28, 0));                    // mem[28] = 12
-    emit(SW(31, 32, 0));                    // mem[32] = 0x31
+    emit(SW(28, 28, 30));                    // mem[28] = 12
+    emit(SW(31, 32, 30));                    // mem[32] = 0x31
     gm(28, 32'd12); gm(32, 32'h31);
 
     // e: bad load right before a mispredicted branch, and right before a jal (2 bus errors)
@@ -435,8 +543,8 @@ begin
     emit(ADDI(4, 4, 200));                  // skipped
     L_j8 = pc;
     emit(ADDI(4, 4, 2));                    // x4 = 8
-    emit(SW(4, 36, 0));                     // mem[36] = 8
-    emit(SW(6, 40, 0));                     // mem[40] = 0x55
+    emit(SW(4, 36, 30));                     // mem[36] = 8
+    emit(SW(6, 40, 30));                     // mem[40] = 0x55
     gm(36, 32'd8); gm(40, 32'h55);
 
     // ---------- S9: operand capture during the older-transfer hold ----------
@@ -447,24 +555,24 @@ begin
     // Free registers here: x1 x2 x16 x27. Data memory words 96..116 are free.
 
     // C1: misaligned LOAD, base comes from a LOAD (P), A is a store. Right base 33 (misaligned), stale base 40 (valid, mem[40] = 0x55).
-    emit(ADDI(1, 0, 12'd33));
-    emit(SW(1, 96, 0));                     // mem[96] = 33
-    emit(ADDI(27, 0, 12'd40));              // stale base
+    emit(ADDI(1, 30, 12'd33));
+    emit(SW(1, 96, 30));                     // mem[96] = 33
+    emit(ADDI(27, 30, 12'd40));             // stale base
     emit(ADDI(2, 0, 12'h0AA));              // x2 = 0xAA: must survive (the load is skipped)
-    emit(LW(27, 96, 0));                    // P: x27 = 33
-    emit(SW(2, 100, 0));                    // A: mem[100] = 0xAA
+    emit(LW(27, 96, 30));                    // P: x27 = 33
+    emit(SW(2, 100, 30));                    // A: mem[100] = 0xAA
     emit(LW(2, 0, 27));                     // B: address 33, misaligned, cause 4. Stale base would load 0x55 into x2.
     emit(NOP);
-    emit(SW(2, 104, 0));                    // mem[104] = 0xAA
-    gm(96, 32'd33); gm(100, 32'hAA); gm(104, 32'hAA);
+    emit(SW(2, 104, 30));                    // mem[104] = 0xAA
+    gm(96, 32'h10000021); gm(100, 32'hAA); gm(104, 32'hAA);
 
     // C2: misaligned STORE, base comes from an ALU op (P), A is a load. Right base 109 (misaligned), stale base 108 (valid).
-    emit(ADDI(27, 0, 12'd108));             // stale base
+    emit(ADDI(27, 30, 12'd108));            // stale base
     emit(ADDI(2, 0, 12'h0BB));              // x2 = 0xBB: the data
-    emit(ADDI(27, 0, 12'd109));             // P
-    emit(LW(16, 100, 0));                   // A: x16 = 0xAA
+    emit(ADDI(27, 30, 12'd109));            // P
+    emit(LW(16, 100, 30));                   // A: x16 = 0xAA
     emit(SW(2, 0, 27));                     // B: address 109, misaligned, cause 6. Stale base would write 0xBB to mem[108].
-    emit(SW(16, 112, 0));                   // mem[112] = 0xAA
+    emit(SW(16, 112, 30));                   // mem[112] = 0xAA
     gm(108, 32'd0); gm(112, 32'hAA);
 
     // C3: taken branch with a misaligned target (cause 0). The branch needs rs2 (x1) from the producer P: right x1 = 5 (equal, taken),
@@ -472,7 +580,7 @@ begin
     emit(ADDI(27, 0, 12'd5));
     emit(ADDI(1, 0, 12'd7));                // stale rs2
     emit(ADDI(1, 0, 12'd5));                // P
-    emit(SW(2, 116, 0));                    // A: mem[116] = 0xBB
+    emit(SW(2, 116, 30));                    // A: mem[116] = 0xBB
     emit(BRL(3'b000, 27, 1, pc + 10));      // B: beq x27,x1: taken, target = pc + 10 has bit 1 set
     emit(NOP);
     gm(116, 32'hBB);
